@@ -12,6 +12,17 @@ const CONFIG = Object.freeze({
   WIND_FOG: .44, WIND_PLAYER: 1, RECOIL_LIMIT: 2, RECOIL_RESET: .28,
   ENEMY_W: 38, ENEMY_H: 35, ENEMY_SPEED: 54, ENEMY_GRAVITY: 1050, ENEMY_MAX_SPEED: 470,
   ENEMY_MIN_X: -100, ENEMY_MAX_X: 3300, ENEMY_SPAWNS: [900, 1320, 1710],
+  FOG_ANCHOR: Object.freeze({
+    ID: "fog-anchor-encounter", START_X: 2450, WIDTH: 64, HEIGHT: 70,
+    NORMAL_WIND_RESPONSE: .045, STAGGERED_WIND_RESPONSE: .92,
+    STAGGER_DURATION: 5.5, PROJECTILE_INTERVAL: 2.8, MAX_HORIZONTAL_VELOCITY: 185,
+    DRAG: 210, CONTACT_DAMAGE: 1, ACTIVATION_RANGE: 520,
+    PROJECTILE_OFFSET_X: 8, PROJECTILE_OFFSET_Y: 24,
+    ZONE_X: 2580, ZONE_Y: 365, ZONE_WIDTH: 125, ZONE_HEIGHT: 90,
+    PARTICLE_COUNT: 20, FEEDBACK_TIME: .7, VIBRATION_DISTANCE: 3,
+    GROUND_MARK_WIDTH: 82, GROUND_MARK_HEIGHT: 10, STREAK_LENGTH: 30, STREAK_GAP: 18,
+    VIBRATION_RATE: 28, SPIKE_COUNT: 4, ZONE_LINE_WIDTH: 4
+  }),
   PROJECTILE_R: 11, PROJECTILE_SPEED: 205, PROJECTILE_MAX_SPEED: 510, PROJECTILE_LIFE: 8,
   PROJECTILE_MARGIN: 180, TURRET_X: 1880, TURRET_Y: 370, TURRET_RATE: 2.5,
   FOG_START: 1480, FOG_END: 3190, FOG_STEP_X: 92, FOG_ROWS: 4, FOG_ROW_GAP: 74,
@@ -27,7 +38,7 @@ const CONFIG = Object.freeze({
     SUPPRESSION_MIN_DENSITY: .18, FEEDBACK_TIME: .22, BLOCK_PARTICLES: 7,
     TILT_MAX: .11, STREAK_LENGTH: 24, STREAK_GAP: 14, INDICATOR_ALPHA: .2
   }),
-  BOSS_X: 2920, BOSS_Y: 330, BOSS_R: 52, BOSS_TRIGGER: 2470, BOSS_ANOMALY: 100,
+  BOSS_X: 2920, BOSS_Y: 330, BOSS_R: 52, BOSS_TRIGGER: 2720, BOSS_ANOMALY: 100,
   BOSS_HIT: 25, BOSS_SHOT_RATE: 2.15, BOSS_SHOT_MIN: 1.15, BOSS_SHOT_RATE_STEP: .18,
   BOSS_CORE_HIT_R: 63, BOSS_FOG_THRESHOLD: .48, BOSS_FOG_BURST: .045,
   NORMALIZE_TIME: 3.2, NORMALIZE_FADE: .36, CAMERA_LEAD: 220, CAMERA_LERP: .09,
@@ -39,6 +50,7 @@ const CONFIG = Object.freeze({
     [980, "空中で X：風と逆向きに反動"], [1450, "軽い敵は風で場外へ"],
     [1840, "弾は風で軌道を変えられる"], [2070, "風で観測ブイを霧の航路へ"],
     [2320, "ブイを足場にし、残る霧は風で晴らす"],
+    [2490, "返した弾で錨を浮かせ、格納区画へ"],
     [2670, "核の霧を晴らし、敵弾を反射せよ"]
   ]
 });
@@ -64,7 +76,9 @@ const ASSETS = Object.freeze({
   boss: createImage("monsters.monster_fog_boss_idle"),
   wind: createImage("cards.card_wind_player_cast"),
   fog: createImage("cards.card_fog_world_effect"),
-  buoy: createImage("cards.weather_fog_local_observe")
+  buoy: createImage("cards.weather_fog_local_observe"),
+  anchorIdle: createImage("monsters.monster_fog_heavy_idle"),
+  anchorStagger: createImage("monsters.monster_fog_heavy_stagger")
 });
 function drawable(image) { return Boolean(image?.loadedSuccessfully && image.naturalWidth > 0 && image.naturalHeight > 0); }
 const clamp = (value, min, max) => Number.isFinite(value) ? Math.max(min, Math.min(max, value)) : min;
@@ -80,7 +94,7 @@ function makeFog() {
   for (let x = CONFIG.FOG_START; x <= CONFIG.FOG_END; x += CONFIG.FOG_STEP_X) {
     for (let row = 0; row < CONFIG.FOG_ROWS; row += 1) {
       const core = Math.abs(x - CONFIG.BOSS_X) < CONFIG.FOG_BOSS_RADIUS;
-      cells.push({ x, homeX: x, y: CONFIG.FOG_Y + row * CONFIG.FOG_ROW_GAP, homeY: CONFIG.FOG_Y + row * CONFIG.FOG_ROW_GAP,
+      cells.push({ type: "fog", windResponseMultiplier: CONFIG.WIND_FOG, x, homeX: x, y: CONFIG.FOG_Y + row * CONFIG.FOG_ROW_GAP, homeY: CONFIG.FOG_Y + row * CONFIG.FOG_ROW_GAP,
         vx: 0, vy: 0, density: core ? CONFIG.FOG_CORE_DENSITY : CONFIG.FOG_DENSITY, baseDensity: core ? CONFIG.FOG_CORE_DENSITY : CONFIG.FOG_DENSITY, core });
     }
   }
@@ -94,12 +108,23 @@ function createGameState(phase = "start") {
       moveVx: 0, externalVx: 0, vx: 0, vy: 0,
       hp: CONFIG.PLAYER_HP, facing: 1, grounded: false, standingWindObject: null,
       invuln: 0, recoilCount: 0, recoilReset: 0 },
-    stage: { turretTimer: CONFIG.TURRET_RATE, hints: CONFIG.HINTS, bossEntered: false, normalizedTimer: 0 },
+    stage: { turretTimer: CONFIG.TURRET_RATE, hints: CONFIG.HINTS, bossEntered: false, normalizedTimer: 0,
+      anchorNeutralized: false, anchorFeedbackTimer: 0 },
     boss: { x: CONFIG.BOSS_X, y: CONFIG.BOSS_Y, r: CONFIG.BOSS_R, anomaly: CONFIG.BOSS_ANOMALY, shotTimer: CONFIG.BOSS_SHOT_RATE, active: false },
-    enemies: CONFIG.ENEMY_SPAWNS.map((x, i) => ({ x, y: CONFIG.GROUND_Y - CONFIG.ENEMY_H, w: CONFIG.ENEMY_W, h: CONFIG.ENEMY_H, vx: i % 2 ? -CONFIG.ENEMY_SPEED : CONFIG.ENEMY_SPEED, vy: 0, alive: true })),
+    enemies: [
+      ...CONFIG.ENEMY_SPAWNS.map((x, i) => ({ type: "lightweight", windResponseMultiplier: CONFIG.WIND_ENEMY,
+        x, y: CONFIG.GROUND_Y - CONFIG.ENEMY_H, w: CONFIG.ENEMY_W, h: CONFIG.ENEMY_H,
+        vx: i % 2 ? -CONFIG.ENEMY_SPEED : CONFIG.ENEMY_SPEED, vy: 0, active: true })),
+      { id: CONFIG.FOG_ANCHOR.ID, type: "fogAnchor", x: CONFIG.FOG_ANCHOR.START_X,
+        y: CONFIG.GROUND_Y - CONFIG.FOG_ANCHOR.HEIGHT, w: CONFIG.FOG_ANCHOR.WIDTH,
+        h: CONFIG.FOG_ANCHOR.HEIGHT, vx: 0, vy: 0, active: true, state: "anchored",
+        staggerTimer: 0, shootTimer: CONFIG.FOG_ANCHOR.PROJECTILE_INTERVAL,
+        windResponseMultiplier: CONFIG.FOG_ANCHOR.NORMAL_WIND_RESPONSE }
+    ],
     windObjects: [{ type: "observationBuoy", x: CONFIG.BUOY.START_X, y: CONFIG.BUOY.START_Y,
       vx: 0, vy: 0, width: CONFIG.BUOY.WIDTH, height: CONFIG.BUOY.HEIGHT,
-      grounded: true, active: true, dx: 0, dy: 0, windFeedback: 0 }],
+      grounded: true, active: true, dx: 0, dy: 0, windFeedback: 0,
+      windResponseMultiplier: CONFIG.BUOY.WIND_RESPONSE }],
     projectiles: [], fogCells: makeFog(), particles: []
   };
 }
@@ -155,8 +180,9 @@ function inWindRegion(object, dir) {
   return forward >= 0 && forward <= CONFIG.WIND_RANGE && side <= CONFIG.WIND_WIDTH / 2;
 }
 // One reusable interaction path for every wind-responsive body.
-function applyWind(object, response, dt, dir = gameState.input.windDir) {
+function applyWind(object, dt, dir = gameState.input.windDir) {
   if (!object || !inWindRegion(object, dir)) return false;
+  const response = Number.isFinite(object.windResponseMultiplier) ? object.windResponseMultiplier : 0;
   object.vx = clamp((object.vx ?? 0) + dir.x * CONFIG.WIND_FORCE * response * dt, -CONFIG.PROJECTILE_MAX_SPEED, CONFIG.PROJECTILE_MAX_SPEED);
   object.vy = clamp((object.vy ?? 0) + dir.y * CONFIG.WIND_FORCE * response * dt, -CONFIG.MAX_Y_SPEED, CONFIG.MAX_Y_SPEED);
   return true;
@@ -170,10 +196,10 @@ function beginWind(direction) {
     player.recoilCount += 1; player.recoilReset = CONFIG.RECOIL_RESET;
   }
 }
-function damagePlayer(sourceX) {
+function damagePlayer(sourceX, amount = 1) {
   const p = gameState.player;
   if (p.invuln > 0 || gameState.result) return;
-  p.hp = clamp(p.hp - 1, 0, CONFIG.PLAYER_HP); p.invuln = CONFIG.INVULN;
+  p.hp = clamp(p.hp - amount, 0, CONFIG.PLAYER_HP); p.invuln = CONFIG.INVULN;
   p.externalVx = p.x < sourceX ? -CONFIG.KNOCKBACK_X : CONFIG.KNOCKBACK_X; p.vy = -CONFIG.KNOCKBACK_Y;
   if (p.hp === 0) { gameState.phase = "gameover"; gameState.result = "defeated"; }
 }
@@ -181,7 +207,7 @@ function updateWindObjects(dt) {
   for (const object of gameState.windObjects) {
     if (!object?.active || object.type !== "observationBuoy") continue;
     const previousX = object.x, previousY = object.y;
-    if (gameState.input.windActive > 0 && applyWind(object, CONFIG.BUOY.WIND_RESPONSE, dt)) {
+    if (gameState.input.windActive > 0 && applyWind(object, dt)) {
       object.windFeedback = CONFIG.BUOY.FEEDBACK_TIME;
       object.grounded = false;
     }
@@ -235,20 +261,63 @@ function updatePlayer(dt, controls) {
 }
 function updateEnemies(dt) {
   for (const enemy of gameState.enemies) {
-    if (!enemy?.alive) continue;
+    if (!enemy?.active) continue;
+    if (enemy.type === "fogAnchor") {
+      if (enemy.state === "staggered") {
+        enemy.staggerTimer = Math.max(0, enemy.staggerTimer - dt);
+        if (enemy.staggerTimer === 0) {
+          enemy.state = "anchored";
+          enemy.windResponseMultiplier = CONFIG.FOG_ANCHOR.NORMAL_WIND_RESPONSE;
+        }
+      } else if (Math.abs(gameState.player.x - enemy.x) <= CONFIG.FOG_ANCHOR.ACTIVATION_RANGE) {
+        enemy.shootTimer -= dt;
+        if (enemy.shootTimer <= 0) {
+          const player = gameState.player;
+          spawnProjectile(enemy.x + CONFIG.FOG_ANCHOR.PROJECTILE_OFFSET_X,
+            enemy.y + CONFIG.FOG_ANCHOR.PROJECTILE_OFFSET_Y, player.x + player.w / 2,
+            player.y + player.h / 2, false, enemy.id);
+          enemy.shootTimer = CONFIG.FOG_ANCHOR.PROJECTILE_INTERVAL;
+        }
+      }
+    }
     enemy.vy += CONFIG.ENEMY_GRAVITY * dt;
-    if (gameState.input.windActive > 0) applyWind(enemy, CONFIG.WIND_ENEMY, dt);
-    enemy.vx = clamp(enemy.vx, -CONFIG.ENEMY_MAX_SPEED, CONFIG.ENEMY_MAX_SPEED);
+    if (gameState.input.windActive > 0) applyWind(enemy, dt);
+    const maxVx = enemy.type === "fogAnchor" ? CONFIG.FOG_ANCHOR.MAX_HORIZONTAL_VELOCITY : CONFIG.ENEMY_MAX_SPEED;
+    enemy.vx = clamp(enemy.vx, -maxVx, maxVx);
+    if (enemy.type === "fogAnchor") {
+      const drag = CONFIG.FOG_ANCHOR.DRAG * dt;
+      enemy.vx = Math.abs(enemy.vx) <= drag ? 0 : enemy.vx - Math.sign(enemy.vx) * drag;
+    }
     enemy.x += enemy.vx * dt; enemy.y += enemy.vy * dt;
     if (enemy.y + enemy.h >= CONFIG.GROUND_Y) { enemy.y = CONFIG.GROUND_Y - enemy.h; enemy.vy = 0; }
-    if (overlaps(gameState.player, enemy)) damagePlayer(enemy.x);
-    enemy.alive = enemy.x > CONFIG.ENEMY_MIN_X && enemy.x < CONFIG.ENEMY_MAX_X;
+    if (overlaps(gameState.player, enemy)) damagePlayer(enemy.x,
+      enemy.type === "fogAnchor" ? CONFIG.FOG_ANCHOR.CONTACT_DAMAGE : 1);
+    if (enemy.type === "fogAnchor") {
+      const fullyContained = enemy.x >= CONFIG.FOG_ANCHOR.ZONE_X &&
+        enemy.x + enemy.w <= CONFIG.FOG_ANCHOR.ZONE_X + CONFIG.FOG_ANCHOR.ZONE_WIDTH &&
+        enemy.y >= CONFIG.FOG_ANCHOR.ZONE_Y &&
+        enemy.y + enemy.h <= CONFIG.FOG_ANCHOR.ZONE_Y + CONFIG.FOG_ANCHOR.ZONE_HEIGHT;
+      if (enemy.state === "staggered" && fullyContained) neutralizeFogAnchor(enemy);
+    } else enemy.active = enemy.x > CONFIG.ENEMY_MIN_X && enemy.x < CONFIG.ENEMY_MAX_X;
   }
 }
-function spawnProjectile(x, y, targetX, targetY, bossShot) {
+function neutralizeFogAnchor(enemy) {
+  enemy.active = false;
+  gameState.stage.anchorNeutralized = true;
+  gameState.stage.anchorFeedbackTimer = CONFIG.FOG_ANCHOR.FEEDBACK_TIME;
+  for (let i = 0; i < CONFIG.FOG_ANCHOR.PARTICLE_COUNT; i += 1) {
+    const angle = i / CONFIG.FOG_ANCHOR.PARTICLE_COUNT * Math.PI * 2;
+    gameState.particles.push({ x: enemy.x + enemy.w / 2, y: enemy.y + enemy.h / 2,
+      vx: Math.cos(angle) * CONFIG.PARTICLE_SPEED, vy: Math.sin(angle) * CONFIG.PARTICLE_SPEED,
+      life: CONFIG.PARTICLE_LIFE, kind: "anchorNeutralized" });
+  }
+}
+function spawnProjectile(x, y, targetX, targetY, bossShot, sourceEnemyId = null) {
   const dx = targetX - x, dy = targetY - y, length = Math.hypot(dx, dy) || 1;
-  gameState.projectiles.push({ x, y, r: CONFIG.PROJECTILE_R, vx: dx / length * CONFIG.PROJECTILE_SPEED,
-    vy: dy / length * CONFIG.PROJECTILE_SPEED, life: CONFIG.PROJECTILE_LIFE, hostile: true, reflected: false, bossShot });
+  gameState.projectiles.push({ type: "projectile", windResponseMultiplier: CONFIG.WIND_PROJECTILE,
+    x, y, r: CONFIG.PROJECTILE_R, vx: dx / length * CONFIG.PROJECTILE_SPEED,
+    vy: dy / length * CONFIG.PROJECTILE_SPEED, life: CONFIG.PROJECTILE_LIFE,
+    hostile: true, reflected: false, bossShot, sourceEnemyId });
 }
 function localCoreFog() {
   const nearby = gameState.fogCells.filter(cell => cell && Math.hypot(cell.x - CONFIG.BOSS_X, cell.y - CONFIG.BOSS_Y) < CONFIG.FOG_BOSS_RADIUS);
@@ -258,7 +327,7 @@ function updateProjectiles(dt) {
   const boss = gameState.boss;
   for (const shot of gameState.projectiles) {
     if (!shot || shot.life <= 0) continue;
-    if (gameState.input.windActive > 0 && applyWind(shot, CONFIG.WIND_PROJECTILE, dt)) { shot.reflected = true; shot.hostile = false; }
+    if (gameState.input.windActive > 0 && applyWind(shot, dt)) { shot.reflected = true; shot.hostile = false; }
     shot.x += shot.vx * dt; shot.y += shot.vy * dt; shot.life -= dt;
     if (shot.hostile) {
       for (const object of gameState.windObjects) {
@@ -274,6 +343,16 @@ function updateProjectiles(dt) {
     }
     if (shot.life <= 0) continue;
     if (shot.hostile && circleRect(shot, gameState.player)) { damagePlayer(shot.x); shot.life = 0; }
+    if (shot.life > 0 && shot.reflected && shot.sourceEnemyId) {
+      const source = gameState.enemies.find(enemy => enemy?.active && enemy.type === "fogAnchor" && enemy.id === shot.sourceEnemyId);
+      if (source && circleRect(shot, source)) {
+        source.state = "staggered";
+        source.staggerTimer = CONFIG.FOG_ANCHOR.STAGGER_DURATION;
+        source.windResponseMultiplier = CONFIG.FOG_ANCHOR.STAGGERED_WIND_RESPONSE;
+        source.shootTimer = CONFIG.FOG_ANCHOR.PROJECTILE_INTERVAL;
+        shot.life = 0;
+      }
+    }
     if (boss.active && shot.reflected && Math.hypot(shot.x - boss.x, shot.y - boss.y) < CONFIG.BOSS_CORE_HIT_R && localCoreFog() < CONFIG.BOSS_FOG_THRESHOLD) {
       boss.anomaly = clamp(boss.anomaly - CONFIG.BOSS_HIT, 0, CONFIG.BOSS_ANOMALY); shot.life = 0;
       for (let i = 0; i < CONFIG.PARTICLE_COUNT; i += 1) {
@@ -287,7 +366,7 @@ function updateFog(dt) {
   const normalized = gameState.boss.anomaly === 0;
   for (const cell of gameState.fogCells) {
     if (!cell) continue;
-    if (gameState.input.windActive > 0 && applyWind(cell, CONFIG.WIND_FOG, dt)) cell.density -= CONFIG.FOG_CLEAR * dt / CONFIG.WIND_DURATION;
+    if (gameState.input.windActive > 0 && applyWind(cell, dt)) cell.density -= CONFIG.FOG_CLEAR * dt / CONFIG.WIND_DURATION;
     cell.x += cell.vx * dt; cell.y += cell.vy * dt; cell.vx *= CONFIG.FOG_DAMPING; cell.vy *= CONFIG.FOG_DAMPING;
     const suppressed = gameState.windObjects.some(object => object?.active &&
       Math.hypot(cell.x - (object.x + object.width / 2), cell.y - (object.y + object.height / 2)) <= CONFIG.BUOY.FOG_SUPPRESSION_RADIUS);
@@ -329,9 +408,10 @@ function update(rawDt) {
   if (state.phase !== "playing") { state.input.pressed = {}; return; }
   const controls = interpretInput();
   state.time += dt; state.input.windCooldown = Math.max(0, state.input.windCooldown - dt); state.input.windActive = Math.max(0, state.input.windActive - dt);
+  state.stage.anchorFeedbackTimer = Math.max(0, state.stage.anchorFeedbackTimer - dt);
   if (controls.windHeld && state.input.windCooldown === 0) beginWind(controls.windDirection);
   updateWindObjects(dt); updatePlayer(dt, controls); updateEnemies(dt); updateProjectiles(dt); updateFog(dt); updateBoss(dt); updateParticles(dt);
-  state.enemies = state.enemies.filter(enemy => enemy?.alive);
+  state.enemies = state.enemies.filter(enemy => enemy?.active);
   state.projectiles = state.projectiles.filter(shot => shot && shot.life > 0 && shot.x > -CONFIG.PROJECTILE_MARGIN && shot.x < CONFIG.WORLD_WIDTH + CONFIG.PROJECTILE_MARGIN && shot.y > -CONFIG.PROJECTILE_MARGIN && shot.y < CONFIG.HEIGHT + CONFIG.PROJECTILE_MARGIN);
   state.particles = state.particles.filter(particle => particle && particle.life > 0);
   const targetCamera = clamp(state.player.x - CONFIG.CAMERA_LEAD, 0, CONFIG.WORLD_WIDTH - CONFIG.WIDTH);
@@ -351,8 +431,23 @@ function renderWorld() {
   const cam = gameState.camera.x; ctx.save(); ctx.translate(-cam, 0);
   ctx.fillStyle = CONFIG.PLATFORM_COLOR; ctx.fillRect(0, CONFIG.GROUND_Y, CONFIG.WORLD_WIDTH, CONFIG.HEIGHT - CONFIG.GROUND_Y);
   ctx.fillStyle = "#395c68"; for (let x = 0; x < CONFIG.WORLD_WIDTH; x += 80) ctx.fillRect(x, CONFIG.GROUND_Y, 58, 7);
+  const zonePulse = gameState.stage.anchorNeutralized || gameState.stage.anchorFeedbackTimer > 0;
+  ctx.fillStyle = zonePulse ? "#7ce8cf55" : "#6fc6d52b";
+  ctx.strokeStyle = zonePulse ? "#b7ffe9" : "#79c9d4";
+  ctx.lineWidth = CONFIG.FOG_ANCHOR.ZONE_LINE_WIDTH;
+  ctx.fillRect(CONFIG.FOG_ANCHOR.ZONE_X, CONFIG.FOG_ANCHOR.ZONE_Y,
+    CONFIG.FOG_ANCHOR.ZONE_WIDTH, CONFIG.FOG_ANCHOR.ZONE_HEIGHT);
+  ctx.strokeRect(CONFIG.FOG_ANCHOR.ZONE_X, CONFIG.FOG_ANCHOR.ZONE_Y,
+    CONFIG.FOG_ANCHOR.ZONE_WIDTH, CONFIG.FOG_ANCHOR.ZONE_HEIGHT);
+  ctx.fillStyle = "#d9fbff"; ctx.font = "bold 14px system-ui";
+  ctx.fillText(gameState.stage.anchorNeutralized ? "CONTAINED" : "MAINTENANCE BAY",
+    CONFIG.FOG_ANCHOR.ZONE_X, CONFIG.FOG_ANCHOR.ZONE_Y - CONFIG.FOG_ANCHOR.GROUND_MARK_HEIGHT);
   ctx.fillStyle = "#547987"; ctx.fillRect(CONFIG.TURRET_X - 15, CONFIG.TURRET_Y, 30, CONFIG.GROUND_Y - CONFIG.TURRET_Y);
-  for (const enemy of gameState.enemies) if (enemy) drawAsset(ASSETS.light, enemy.x, enemy.y, enemy.w, enemy.h, () => { ctx.fillStyle = "#ad78bd"; ctx.beginPath(); ctx.ellipse(enemy.x + enemy.w / 2, enemy.y + enemy.h / 2, enemy.w / 2, enemy.h / 2, 0, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = "#fff"; ctx.fillRect(enemy.x + 8, enemy.y + 11, 6, 6); });
+  for (const enemy of gameState.enemies) {
+    if (!enemy?.active) continue;
+    if (enemy.type === "fogAnchor") renderFogAnchor(enemy);
+    else drawAsset(ASSETS.light, enemy.x, enemy.y, enemy.w, enemy.h, () => { ctx.fillStyle = "#ad78bd"; ctx.beginPath(); ctx.ellipse(enemy.x + enemy.w / 2, enemy.y + enemy.h / 2, enemy.w / 2, enemy.h / 2, 0, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = "#fff"; ctx.fillRect(enemy.x + 8, enemy.y + 11, 6, 6); });
+  }
   for (const object of gameState.windObjects) {
     if (!object?.active || object.type !== "observationBuoy") continue;
     const cx = object.x + object.width / 2, cy = object.y + object.height / 2;
@@ -371,9 +466,38 @@ function renderWorld() {
   if (boss.active || gameState.player.x > CONFIG.BOSS_TRIGGER - CONFIG.WIDTH) drawAsset(ASSETS.boss, boss.x - boss.r, boss.y - boss.r, boss.r * 2, boss.r * 2, () => { ctx.fillStyle = localCoreFog() < CONFIG.BOSS_FOG_THRESHOLD ? "#ffd866" : "#6c748a"; ctx.beginPath(); ctx.arc(boss.x, boss.y, boss.r, 0, Math.PI * 2); ctx.fill(); ctx.strokeStyle = "#eafcff"; ctx.lineWidth = 5; ctx.stroke(); });
   for (const shot of gameState.projectiles) if (shot) { ctx.fillStyle = shot.reflected ? "#78f4ff" : "#ff7292"; ctx.shadowColor = ctx.fillStyle; ctx.shadowBlur = 14; ctx.beginPath(); ctx.arc(shot.x, shot.y, shot.r, 0, Math.PI * 2); ctx.fill(); ctx.shadowBlur = 0; }
   const p = gameState.player; if (p.invuln <= 0 || Math.floor(gameState.time * 12) % 2 === 0) { ctx.fillStyle = "#f5fbff"; ctx.fillRect(p.x, p.y, p.w, p.h); ctx.fillStyle = "#2dcbe4"; ctx.fillRect(p.x + (p.facing > 0 ? 21 : 5), p.y + 12, 8, 8); ctx.fillStyle = "#efb94b"; ctx.fillRect(p.x + 7, p.y + 31, 20, 6); }
-  for (const particle of gameState.particles) if (particle) { ctx.globalAlpha = clamp(particle.life / CONFIG.PARTICLE_LIFE, 0, 1); ctx.fillStyle = particle.kind === "buoyBlock" ? "#b9f7ff" : "#fff2a0"; ctx.fillRect(particle.x, particle.y, 5, 5); } ctx.globalAlpha = 1;
+  for (const particle of gameState.particles) if (particle) { ctx.globalAlpha = clamp(particle.life / CONFIG.PARTICLE_LIFE, 0, 1); ctx.fillStyle = particle.kind === "buoyBlock" ? "#b9f7ff" : particle.kind === "anchorNeutralized" ? "#9affdf" : "#fff2a0"; ctx.fillRect(particle.x, particle.y, 5, 5); } ctx.globalAlpha = 1;
   if (gameState.input.windActive > 0) { const d = gameState.input.windDir, cx = p.x + p.w / 2, cy = p.y + p.h / 2; ctx.strokeStyle = "#a8f5ff"; ctx.lineWidth = 5; ctx.lineCap = "round"; for (let i = -1; i <= 1; i += 1) { ctx.beginPath(); ctx.moveTo(cx - d.y * i * 22, cy + d.x * i * 22); ctx.lineTo(cx + d.x * CONFIG.WIND_RANGE - d.y * i * 22, cy + d.y * CONFIG.WIND_RANGE + d.x * i * 22); ctx.stroke(); } }
   for (const cell of gameState.fogCells) if (cell?.density > 0) { ctx.globalAlpha = cell.density * CONFIG.FOG_ALPHA; ctx.fillStyle = "#d6e1e4"; ctx.beginPath(); ctx.arc(cell.x, cell.y, CONFIG.FOG_RADIUS, 0, Math.PI * 2); ctx.fill(); } ctx.globalAlpha = 1; ctx.restore();
+}
+function renderFogAnchor(enemy) {
+  const staggered = enemy.state === "staggered";
+  const vibration = staggered ? Math.sin(gameState.time * CONFIG.FOG_ANCHOR.VIBRATION_RATE) * CONFIG.FOG_ANCHOR.VIBRATION_DISTANCE : 0;
+  const x = enemy.x + vibration, y = enemy.y;
+  ctx.fillStyle = staggered ? "#8ef4e0" : "#182835";
+  ctx.fillRect(x + (enemy.w - CONFIG.FOG_ANCHOR.GROUND_MARK_WIDTH) / 2, CONFIG.GROUND_Y - CONFIG.FOG_ANCHOR.GROUND_MARK_HEIGHT,
+    CONFIG.FOG_ANCHOR.GROUND_MARK_WIDTH, CONFIG.FOG_ANCHOR.GROUND_MARK_HEIGHT);
+  const asset = staggered ? ASSETS.anchorStagger : ASSETS.anchorIdle;
+  drawAsset(asset, x, y, enemy.w, enemy.h, () => {
+    ctx.fillStyle = staggered ? "#80ead7" : "#3b4a58";
+    ctx.strokeStyle = staggered ? "#fff6ae" : "#111923";
+    ctx.lineWidth = CONFIG.FOG_ANCHOR.ZONE_LINE_WIDTH;
+    ctx.beginPath(); ctx.roundRect(x, y, enemy.w, enemy.h, enemy.w / CONFIG.FOG_ANCHOR.SPIKE_COUNT); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = staggered ? "#fff8af" : "#7c91a1";
+    ctx.beginPath(); ctx.arc(x + enemy.w / 2, y + enemy.h / 2, enemy.w / CONFIG.FOG_ANCHOR.SPIKE_COUNT, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = staggered ? "#fff" : "#26333e";
+    for (let i = 0; i < CONFIG.FOG_ANCHOR.SPIKE_COUNT; i += 1) {
+      const sx = x + i * enemy.w / (CONFIG.FOG_ANCHOR.SPIKE_COUNT - 1);
+      ctx.beginPath(); ctx.moveTo(sx, y + enemy.h); ctx.lineTo(sx, CONFIG.GROUND_Y); ctx.stroke();
+    }
+  });
+  if (staggered) {
+    ctx.strokeStyle = "#b7fff2";
+    for (let i = -1; i <= 1; i += 1) {
+      ctx.beginPath(); ctx.moveTo(x - CONFIG.FOG_ANCHOR.STREAK_LENGTH, y + enemy.h / 2 + i * CONFIG.FOG_ANCHOR.STREAK_GAP);
+      ctx.lineTo(x, y + enemy.h / 2 + i * CONFIG.FOG_ANCHOR.STREAK_GAP); ctx.stroke();
+    }
+  }
 }
 function renderUI() {
   ctx.fillStyle = "#07131dcc"; ctx.fillRect(CONFIG.HUD_PAD, CONFIG.HUD_PAD, CONFIG.UI_BAR_W + 20, 76); ctx.fillStyle = "#fff"; ctx.font = "bold 18px system-ui"; ctx.fillText(`HP ${"◆".repeat(gameState.player.hp)}${"◇".repeat(CONFIG.PLAYER_HP - gameState.player.hp)}`, 32, 48); ctx.fillText(`Weather Anomaly ${gameState.boss.anomaly}%`, 32, 78);
