@@ -18,6 +18,15 @@ const CONFIG = Object.freeze({
   FOG_Y: 170, FOG_RADIUS: 76, FOG_DENSITY: .72, FOG_CORE_DENSITY: .94,
   FOG_RECOVERY: .018, FOG_CORE_RECOVERY: .028, FOG_DAMPING: .965, FOG_MIN: 0, FOG_MAX: 1,
   FOG_CLEAR: .36, FOG_ALPHA: .48, FOG_BOSS_RADIUS: 190,
+  BUOY: Object.freeze({
+    START_X: 2110, START_Y: 395, WIDTH: 86, HEIGHT: 30,
+    WIND_RESPONSE: .52, MAX_SPEED_X: 125, MAX_SPEED_Y: 72, DRAG: 72,
+    VERTICAL_DRAG: 135, FLOAT_RETURN: 7.5, MIN_Y: 350, MAX_Y: 425,
+    WORLD_MIN_X: 1960, WORLD_MAX_X: 2435, LAND_TOLERANCE: 8,
+    FOG_SUPPRESSION_RADIUS: 185, FOG_RECOVERY_MULTIPLIER: .3,
+    SUPPRESSION_MIN_DENSITY: .18, FEEDBACK_TIME: .22, BLOCK_PARTICLES: 7,
+    TILT_MAX: .11, STREAK_LENGTH: 24, STREAK_GAP: 14, INDICATOR_ALPHA: .2
+  }),
   BOSS_X: 2920, BOSS_Y: 330, BOSS_R: 52, BOSS_TRIGGER: 2470, BOSS_ANOMALY: 100,
   BOSS_HIT: 25, BOSS_SHOT_RATE: 2.15, BOSS_SHOT_MIN: 1.15, BOSS_SHOT_RATE_STEP: .18,
   BOSS_CORE_HIT_R: 63, BOSS_FOG_THRESHOLD: .48, BOSS_FOG_BURST: .045,
@@ -28,7 +37,8 @@ const CONFIG = Object.freeze({
   HINTS: [
     [120, "← → で移動 / Z でジャンプ"], [520, "X + 方向キー：風で物体を押す"],
     [980, "空中で X：風と逆向きに反動"], [1450, "軽い敵は風で場外へ"],
-    [1840, "弾は風で軌道を変えられる"], [2200, "霧を繰り返し吹き払い、先へ"],
+    [1840, "弾は風で軌道を変えられる"], [2070, "風で観測ブイを霧の航路へ"],
+    [2320, "ブイを足場にし、残る霧は風で晴らす"],
     [2670, "核の霧を晴らし、敵弾を反射せよ"]
   ]
 });
@@ -53,7 +63,8 @@ const ASSETS = Object.freeze({
   light: createImage("monsters.monster_fog_light_move"),
   boss: createImage("monsters.monster_fog_boss_idle"),
   wind: createImage("cards.card_wind_player_cast"),
-  fog: createImage("cards.card_fog_world_effect")
+  fog: createImage("cards.card_fog_world_effect"),
+  buoy: createImage("cards.weather_fog_local_observe")
 });
 function drawable(image) { return Boolean(image?.loadedSuccessfully && image.naturalWidth > 0 && image.naturalHeight > 0); }
 const clamp = (value, min, max) => Number.isFinite(value) ? Math.max(min, Math.min(max, value)) : min;
@@ -81,10 +92,14 @@ function createGameState(phase = "start") {
     input: { keys: {}, pressed: {}, windActive: 0, windCooldown: 0, windDir: { x: 1, y: 0 } },
     player: { x: CONFIG.START_X, y: CONFIG.START_Y, w: CONFIG.PLAYER_W, h: CONFIG.PLAYER_H,
       moveVx: 0, externalVx: 0, vx: 0, vy: 0,
-      hp: CONFIG.PLAYER_HP, facing: 1, grounded: false, invuln: 0, recoilCount: 0, recoilReset: 0 },
+      hp: CONFIG.PLAYER_HP, facing: 1, grounded: false, standingWindObject: null,
+      invuln: 0, recoilCount: 0, recoilReset: 0 },
     stage: { turretTimer: CONFIG.TURRET_RATE, hints: CONFIG.HINTS, bossEntered: false, normalizedTimer: 0 },
     boss: { x: CONFIG.BOSS_X, y: CONFIG.BOSS_Y, r: CONFIG.BOSS_R, anomaly: CONFIG.BOSS_ANOMALY, shotTimer: CONFIG.BOSS_SHOT_RATE, active: false },
     enemies: CONFIG.ENEMY_SPAWNS.map((x, i) => ({ x, y: CONFIG.GROUND_Y - CONFIG.ENEMY_H, w: CONFIG.ENEMY_W, h: CONFIG.ENEMY_H, vx: i % 2 ? -CONFIG.ENEMY_SPEED : CONFIG.ENEMY_SPEED, vy: 0, alive: true })),
+    windObjects: [{ type: "observationBuoy", x: CONFIG.BUOY.START_X, y: CONFIG.BUOY.START_Y,
+      vx: 0, vy: 0, width: CONFIG.BUOY.WIDTH, height: CONFIG.BUOY.HEIGHT,
+      grounded: true, active: true, dx: 0, dy: 0, windFeedback: 0 }],
     projectiles: [], fogCells: makeFog(), particles: []
   };
 }
@@ -162,8 +177,38 @@ function damagePlayer(sourceX) {
   p.externalVx = p.x < sourceX ? -CONFIG.KNOCKBACK_X : CONFIG.KNOCKBACK_X; p.vy = -CONFIG.KNOCKBACK_Y;
   if (p.hp === 0) { gameState.phase = "gameover"; gameState.result = "defeated"; }
 }
+function updateWindObjects(dt) {
+  for (const object of gameState.windObjects) {
+    if (!object?.active || object.type !== "observationBuoy") continue;
+    const previousX = object.x, previousY = object.y;
+    if (gameState.input.windActive > 0 && applyWind(object, CONFIG.BUOY.WIND_RESPONSE, dt)) {
+      object.windFeedback = CONFIG.BUOY.FEEDBACK_TIME;
+      object.grounded = false;
+    }
+    const horizontalDrag = CONFIG.BUOY.DRAG * dt;
+    object.vx = Math.abs(object.vx) <= horizontalDrag ? 0 : object.vx - Math.sign(object.vx) * horizontalDrag;
+    object.vy += (CONFIG.BUOY.START_Y - object.y) * CONFIG.BUOY.FLOAT_RETURN * dt;
+    const verticalDrag = CONFIG.BUOY.VERTICAL_DRAG * dt;
+    object.vy = Math.abs(object.vy) <= verticalDrag ? 0 : object.vy - Math.sign(object.vy) * verticalDrag;
+    object.vx = clamp(object.vx, -CONFIG.BUOY.MAX_SPEED_X, CONFIG.BUOY.MAX_SPEED_X);
+    object.vy = clamp(object.vy, -CONFIG.BUOY.MAX_SPEED_Y, CONFIG.BUOY.MAX_SPEED_Y);
+    object.x = clamp(object.x + object.vx * dt, CONFIG.BUOY.WORLD_MIN_X, CONFIG.BUOY.WORLD_MAX_X - object.width);
+    object.y = clamp(object.y + object.vy * dt, CONFIG.BUOY.MIN_Y, CONFIG.BUOY.MAX_Y);
+    if ((object.x === CONFIG.BUOY.WORLD_MIN_X && object.vx < 0) ||
+        (object.x === CONFIG.BUOY.WORLD_MAX_X - object.width && object.vx > 0)) object.vx = 0;
+    if ((object.y === CONFIG.BUOY.MIN_Y && object.vy < 0) || (object.y === CONFIG.BUOY.MAX_Y && object.vy > 0)) object.vy = 0;
+    object.dx = object.x - previousX;
+    object.dy = object.y - previousY;
+    object.grounded = Math.abs(object.y - CONFIG.BUOY.START_Y) <= CONFIG.BUOY.LAND_TOLERANCE;
+    object.windFeedback = Math.max(0, object.windFeedback - dt);
+  }
+}
 function updatePlayer(dt, controls) {
   const p = gameState.player;
+  const support = Number.isInteger(p.standingWindObject) ? gameState.windObjects[p.standingWindObject] : null;
+  if (support?.active) { p.x = clamp(p.x + support.dx, 0, CONFIG.WORLD_WIDTH - p.w); p.y += support.dy; }
+  else p.standingWindObject = null;
+  const previousBottom = p.y + p.h;
   if (controls.movementX) { p.moveVx += controls.movementX * CONFIG.PLAYER_ACCEL * dt; p.facing = controls.movementX; }
   else { const drag = CONFIG.PLAYER_FRICTION * dt; p.moveVx = Math.abs(p.moveVx) <= drag ? 0 : p.moveVx - Math.sign(p.moveVx) * drag; }
   p.moveVx = clamp(p.moveVx, -CONFIG.PLAYER_SPEED, CONFIG.PLAYER_SPEED);
@@ -174,7 +219,17 @@ function updatePlayer(dt, controls) {
   p.vy += CONFIG.GRAVITY * dt; p.vx = clamp(p.moveVx + p.externalVx, -CONFIG.MAX_X_SPEED, CONFIG.MAX_X_SPEED); p.vy = clamp(p.vy, -CONFIG.MAX_Y_SPEED, CONFIG.MAX_Y_SPEED);
   p.x = clamp(p.x + p.vx * dt, 0, CONFIG.WORLD_WIDTH - p.w); p.y += p.vy * dt;
   if (p.y + p.h >= CONFIG.GROUND_Y) { p.y = CONFIG.GROUND_Y - p.h; p.vy = 0; p.grounded = true; p.recoilCount = 0; }
-  else p.grounded = false;
+  else {
+    p.grounded = false; p.standingWindObject = null;
+    for (let i = 0; i < gameState.windObjects.length; i += 1) {
+      const object = gameState.windObjects[i];
+      if (!object?.active) continue;
+      const top = object.y, horizontal = p.x + p.w > object.x && p.x < object.x + object.width;
+      if (p.vy >= 0 && horizontal && previousBottom <= top + CONFIG.BUOY.LAND_TOLERANCE && p.y + p.h >= top) {
+        p.y = top - p.h; p.vy = 0; p.grounded = true; p.recoilCount = 0; p.standingWindObject = i; break;
+      }
+    }
+  }
   p.invuln = Math.max(0, p.invuln - dt); p.recoilReset = Math.max(0, p.recoilReset - dt);
   if (p.recoilReset === 0 && p.recoilCount > 0) p.recoilCount -= 1;
 }
@@ -205,6 +260,19 @@ function updateProjectiles(dt) {
     if (!shot || shot.life <= 0) continue;
     if (gameState.input.windActive > 0 && applyWind(shot, CONFIG.WIND_PROJECTILE, dt)) { shot.reflected = true; shot.hostile = false; }
     shot.x += shot.vx * dt; shot.y += shot.vy * dt; shot.life -= dt;
+    if (shot.hostile) {
+      for (const object of gameState.windObjects) {
+        if (!object?.active || !circleRect(shot, { x: object.x, y: object.y, w: object.width, h: object.height })) continue;
+        shot.life = 0;
+        for (let i = 0; i < CONFIG.BUOY.BLOCK_PARTICLES; i += 1) {
+          const angle = i / CONFIG.BUOY.BLOCK_PARTICLES * Math.PI * 2;
+          gameState.particles.push({ x: shot.x, y: shot.y, vx: Math.cos(angle) * CONFIG.PARTICLE_SPEED,
+            vy: Math.sin(angle) * CONFIG.PARTICLE_SPEED, life: CONFIG.PARTICLE_LIFE, kind: "buoyBlock" });
+        }
+        break;
+      }
+    }
+    if (shot.life <= 0) continue;
     if (shot.hostile && circleRect(shot, gameState.player)) { damagePlayer(shot.x); shot.life = 0; }
     if (boss.active && shot.reflected && Math.hypot(shot.x - boss.x, shot.y - boss.y) < CONFIG.BOSS_CORE_HIT_R && localCoreFog() < CONFIG.BOSS_FOG_THRESHOLD) {
       boss.anomaly = clamp(boss.anomaly - CONFIG.BOSS_HIT, 0, CONFIG.BOSS_ANOMALY); shot.life = 0;
@@ -221,7 +289,10 @@ function updateFog(dt) {
     if (!cell) continue;
     if (gameState.input.windActive > 0 && applyWind(cell, CONFIG.WIND_FOG, dt)) cell.density -= CONFIG.FOG_CLEAR * dt / CONFIG.WIND_DURATION;
     cell.x += cell.vx * dt; cell.y += cell.vy * dt; cell.vx *= CONFIG.FOG_DAMPING; cell.vy *= CONFIG.FOG_DAMPING;
-    const recovery = cell.core ? CONFIG.FOG_CORE_RECOVERY : CONFIG.FOG_RECOVERY;
+    const suppressed = gameState.windObjects.some(object => object?.active &&
+      Math.hypot(cell.x - (object.x + object.width / 2), cell.y - (object.y + object.height / 2)) <= CONFIG.BUOY.FOG_SUPPRESSION_RADIUS);
+    const recovery = (cell.core ? CONFIG.FOG_CORE_RECOVERY : CONFIG.FOG_RECOVERY) *
+      (suppressed ? CONFIG.BUOY.FOG_RECOVERY_MULTIPLIER : 1);
     const target = normalized ? CONFIG.FOG_MIN : cell.baseDensity * (gameState.boss.anomaly / CONFIG.BOSS_ANOMALY);
     cell.density += (target - cell.density) * recovery * dt;
     cell.density = clamp(cell.density - (normalized ? CONFIG.NORMALIZE_FADE * dt : 0), CONFIG.FOG_MIN, CONFIG.FOG_MAX);
@@ -259,7 +330,7 @@ function update(rawDt) {
   const controls = interpretInput();
   state.time += dt; state.input.windCooldown = Math.max(0, state.input.windCooldown - dt); state.input.windActive = Math.max(0, state.input.windActive - dt);
   if (controls.windHeld && state.input.windCooldown === 0) beginWind(controls.windDirection);
-  updatePlayer(dt, controls); updateEnemies(dt); updateProjectiles(dt); updateFog(dt); updateBoss(dt); updateParticles(dt);
+  updateWindObjects(dt); updatePlayer(dt, controls); updateEnemies(dt); updateProjectiles(dt); updateFog(dt); updateBoss(dt); updateParticles(dt);
   state.enemies = state.enemies.filter(enemy => enemy?.alive);
   state.projectiles = state.projectiles.filter(shot => shot && shot.life > 0 && shot.x > -CONFIG.PROJECTILE_MARGIN && shot.x < CONFIG.WORLD_WIDTH + CONFIG.PROJECTILE_MARGIN && shot.y > -CONFIG.PROJECTILE_MARGIN && shot.y < CONFIG.HEIGHT + CONFIG.PROJECTILE_MARGIN);
   state.particles = state.particles.filter(particle => particle && particle.life > 0);
@@ -282,11 +353,25 @@ function renderWorld() {
   ctx.fillStyle = "#395c68"; for (let x = 0; x < CONFIG.WORLD_WIDTH; x += 80) ctx.fillRect(x, CONFIG.GROUND_Y, 58, 7);
   ctx.fillStyle = "#547987"; ctx.fillRect(CONFIG.TURRET_X - 15, CONFIG.TURRET_Y, 30, CONFIG.GROUND_Y - CONFIG.TURRET_Y);
   for (const enemy of gameState.enemies) if (enemy) drawAsset(ASSETS.light, enemy.x, enemy.y, enemy.w, enemy.h, () => { ctx.fillStyle = "#ad78bd"; ctx.beginPath(); ctx.ellipse(enemy.x + enemy.w / 2, enemy.y + enemy.h / 2, enemy.w / 2, enemy.h / 2, 0, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = "#fff"; ctx.fillRect(enemy.x + 8, enemy.y + 11, 6, 6); });
+  for (const object of gameState.windObjects) {
+    if (!object?.active || object.type !== "observationBuoy") continue;
+    const cx = object.x + object.width / 2, cy = object.y + object.height / 2;
+    const suppressing = gameState.fogCells.some(cell => cell?.density > CONFIG.BUOY.SUPPRESSION_MIN_DENSITY &&
+      Math.hypot(cell.x - cx, cell.y - cy) <= CONFIG.BUOY.FOG_SUPPRESSION_RADIUS);
+    if (suppressing) { ctx.fillStyle = `rgba(113,235,225,${CONFIG.BUOY.INDICATOR_ALPHA})`; ctx.strokeStyle = "#8de9df"; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(cx, cy, CONFIG.BUOY.FOG_SUPPRESSION_RADIUS, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); }
+    if (object.windFeedback > 0) { ctx.strokeStyle = "#b9f7ff"; ctx.lineWidth = 2; for (let i = -1; i <= 1; i += 1) { ctx.beginPath(); ctx.moveTo(object.x - CONFIG.BUOY.STREAK_LENGTH, cy + i * CONFIG.BUOY.STREAK_GAP); ctx.lineTo(object.x, cy + i * CONFIG.BUOY.STREAK_GAP); ctx.stroke(); } }
+    const tilt = clamp(object.vx / CONFIG.BUOY.MAX_SPEED_X, -1, 1) * CONFIG.BUOY.TILT_MAX;
+    ctx.save(); ctx.translate(cx, cy); ctx.rotate(tilt);
+    drawAsset(ASSETS.buoy, -object.width / 2, -object.height / 2, object.width, object.height, () => {
+      ctx.fillStyle = "#f4b34d"; ctx.beginPath(); ctx.ellipse(0, 5, object.width / 2, object.height / 2, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#edf8f6"; ctx.fillRect(-5, -20, 10, 22); ctx.strokeStyle = "#68d5dd"; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(-15, -19); ctx.lineTo(15, -19); ctx.stroke();
+    }); ctx.restore();
+  }
   const boss = gameState.boss;
   if (boss.active || gameState.player.x > CONFIG.BOSS_TRIGGER - CONFIG.WIDTH) drawAsset(ASSETS.boss, boss.x - boss.r, boss.y - boss.r, boss.r * 2, boss.r * 2, () => { ctx.fillStyle = localCoreFog() < CONFIG.BOSS_FOG_THRESHOLD ? "#ffd866" : "#6c748a"; ctx.beginPath(); ctx.arc(boss.x, boss.y, boss.r, 0, Math.PI * 2); ctx.fill(); ctx.strokeStyle = "#eafcff"; ctx.lineWidth = 5; ctx.stroke(); });
   for (const shot of gameState.projectiles) if (shot) { ctx.fillStyle = shot.reflected ? "#78f4ff" : "#ff7292"; ctx.shadowColor = ctx.fillStyle; ctx.shadowBlur = 14; ctx.beginPath(); ctx.arc(shot.x, shot.y, shot.r, 0, Math.PI * 2); ctx.fill(); ctx.shadowBlur = 0; }
   const p = gameState.player; if (p.invuln <= 0 || Math.floor(gameState.time * 12) % 2 === 0) { ctx.fillStyle = "#f5fbff"; ctx.fillRect(p.x, p.y, p.w, p.h); ctx.fillStyle = "#2dcbe4"; ctx.fillRect(p.x + (p.facing > 0 ? 21 : 5), p.y + 12, 8, 8); ctx.fillStyle = "#efb94b"; ctx.fillRect(p.x + 7, p.y + 31, 20, 6); }
-  for (const particle of gameState.particles) if (particle) { ctx.globalAlpha = clamp(particle.life / CONFIG.PARTICLE_LIFE, 0, 1); ctx.fillStyle = "#fff2a0"; ctx.fillRect(particle.x, particle.y, 5, 5); } ctx.globalAlpha = 1;
+  for (const particle of gameState.particles) if (particle) { ctx.globalAlpha = clamp(particle.life / CONFIG.PARTICLE_LIFE, 0, 1); ctx.fillStyle = particle.kind === "buoyBlock" ? "#b9f7ff" : "#fff2a0"; ctx.fillRect(particle.x, particle.y, 5, 5); } ctx.globalAlpha = 1;
   if (gameState.input.windActive > 0) { const d = gameState.input.windDir, cx = p.x + p.w / 2, cy = p.y + p.h / 2; ctx.strokeStyle = "#a8f5ff"; ctx.lineWidth = 5; ctx.lineCap = "round"; for (let i = -1; i <= 1; i += 1) { ctx.beginPath(); ctx.moveTo(cx - d.y * i * 22, cy + d.x * i * 22); ctx.lineTo(cx + d.x * CONFIG.WIND_RANGE - d.y * i * 22, cy + d.y * CONFIG.WIND_RANGE + d.x * i * 22); ctx.stroke(); } }
   for (const cell of gameState.fogCells) if (cell?.density > 0) { ctx.globalAlpha = cell.density * CONFIG.FOG_ALPHA; ctx.fillStyle = "#d6e1e4"; ctx.beginPath(); ctx.arc(cell.x, cell.y, CONFIG.FOG_RADIUS, 0, Math.PI * 2); ctx.fill(); } ctx.globalAlpha = 1; ctx.restore();
 }
