@@ -1,0 +1,6 @@
+:root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; }
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: radial-gradient(circle at 50% 20%, #29435a, #09131e 70%); }
+main { width: min(100%, 1000px); padding: 20px; text-align: center; }
+canvas { display: block; width: 100%; height: auto; border: 2px solid #8fdcf5; border-radius: 10px; background: #172637; box-shadow: 0 20px 60px #0009; }
+.controls { margin: 12px 0 0; color: #cae8f1; letter-spacing: .03em; }
