@@ -25,10 +25,19 @@ const CONFIG = Object.freeze({
   }),
   PROJECTILE_R: 11, PROJECTILE_SPEED: 205, PROJECTILE_MAX_SPEED: 510, PROJECTILE_LIFE: 8,
   PROJECTILE_MARGIN: 180, TURRET_X: 1880, TURRET_Y: 370, TURRET_RATE: 2.5,
-  FOG_START: 1480, FOG_END: 3190, FOG_STEP_X: 92, FOG_ROWS: 4, FOG_ROW_GAP: 74,
+  FOG_START: 1310, FOG_END: 3190, FOG_STEP_X: 92, FOG_ROWS: 4, FOG_ROW_GAP: 74,
   FOG_Y: 170, FOG_RADIUS: 76, FOG_DENSITY: .72, FOG_CORE_DENSITY: .94,
   FOG_RECOVERY: .018, FOG_CORE_RECOVERY: .028, FOG_DAMPING: .965, FOG_MIN: 0, FOG_MAX: 1,
-  FOG_CLEAR: .36, FOG_ALPHA: .48, FOG_BOSS_RADIUS: 190,
+  FOG_CLEAR: .12, FOG_ALPHA: .48, FOG_BOSS_RADIUS: 190,
+  SEARCHLIGHT: Object.freeze({
+    X: 1448, Y: 72, DIRECTION_X: 0, DIRECTION_Y: 1,
+    BEAM_RANGE: 383, BEAM_WIDTH: 34, DAMAGE: 1, FOG_BLOCK_THRESHOLD: .58,
+    HIT_COOLDOWN: 1.05, COLOR: "#fff3a6", ALPHA: .62, SAMPLE_STEP: 18,
+    FOG_SAMPLE_RADIUS: 32, EMITTER_RADIUS: 22, EMITTER_LENGTH: 34,
+    BLOCK_GLOW_RADIUS: 30, BLOCK_GLOW_ALPHA: .82, BEAM_EDGE_WIDTH: 3,
+    SOURCE_MIN_X: 1300, SOURCE_MAX_X: 1410, SOURCE_RECOVERY: .075,
+    SOURCE_MIN_DENSITY: .68
+  }),
   BUOY: Object.freeze({
     START_X: 2110, START_Y: 395, WIDTH: 86, HEIGHT: 30,
     WIND_RESPONSE: .52, MAX_SPEED_X: 125, MAX_SPEED_Y: 72, DRAG: 72,
@@ -48,6 +57,7 @@ const CONFIG = Object.freeze({
   HINTS: [
     [120, "← → で移動 / Z でジャンプ"], [520, "X + 方向キー：風で物体を押す"],
     [980, "空中で X：風と逆向きに反動"], [1450, "軽い敵は風で場外へ"],
+    [1260, "光は風で動かない — 霧を遮蔽物に"],
     [1840, "弾は風で軌道を変えられる"], [2070, "風で観測ブイを霧の航路へ"],
     [2320, "ブイを足場にし、残る霧は風で晴らす"],
     [2490, "返した弾で錨を浮かせ、格納区画へ"],
@@ -78,7 +88,8 @@ const ASSETS = Object.freeze({
   fog: createImage("cards.card_fog_world_effect"),
   buoy: createImage("cards.weather_fog_local_observe"),
   anchorIdle: createImage("monsters.monster_fog_heavy_idle"),
-  anchorStagger: createImage("monsters.monster_fog_heavy_stagger")
+  anchorStagger: createImage("monsters.monster_fog_heavy_stagger"),
+  searchlight: createImage("cards.card_light_world_searchlight")
 });
 function drawable(image) { return Boolean(image?.loadedSuccessfully && image.naturalWidth > 0 && image.naturalHeight > 0); }
 const clamp = (value, min, max) => Number.isFinite(value) ? Math.max(min, Math.min(max, value)) : min;
@@ -125,6 +136,9 @@ function createGameState(phase = "start") {
       vx: 0, vy: 0, width: CONFIG.BUOY.WIDTH, height: CONFIG.BUOY.HEIGHT,
       grounded: true, active: true, dx: 0, dy: 0, windFeedback: 0,
       windResponseMultiplier: CONFIG.BUOY.WIND_RESPONSE }],
+    hazards: [{ type: "searchlight", x: CONFIG.SEARCHLIGHT.X, y: CONFIG.SEARCHLIGHT.Y,
+      directionX: CONFIG.SEARCHLIGHT.DIRECTION_X, directionY: CONFIG.SEARCHLIGHT.DIRECTION_Y,
+      active: true, beamEndX: CONFIG.SEARCHLIGHT.X, beamEndY: CONFIG.GROUND_Y, blockedByFog: false }],
     projectiles: [], fogCells: makeFog(), particles: []
   };
 }
@@ -196,10 +210,10 @@ function beginWind(direction) {
     player.recoilCount += 1; player.recoilReset = CONFIG.RECOIL_RESET;
   }
 }
-function damagePlayer(sourceX, amount = 1) {
+function damagePlayer(sourceX, amount = 1, cooldown = CONFIG.INVULN) {
   const p = gameState.player;
   if (p.invuln > 0 || gameState.result) return;
-  p.hp = clamp(p.hp - amount, 0, CONFIG.PLAYER_HP); p.invuln = CONFIG.INVULN;
+  p.hp = clamp(p.hp - amount, 0, CONFIG.PLAYER_HP); p.invuln = cooldown;
   p.externalVx = p.x < sourceX ? -CONFIG.KNOCKBACK_X : CONFIG.KNOCKBACK_X; p.vy = -CONFIG.KNOCKBACK_Y;
   if (p.hp === 0) { gameState.phase = "gameover"; gameState.result = "defeated"; }
 }
@@ -366,16 +380,54 @@ function updateFog(dt) {
   const normalized = gameState.boss.anomaly === 0;
   for (const cell of gameState.fogCells) {
     if (!cell) continue;
+    // Wind primarily carries the fog cell; the smaller density loss preserves the
+    // original clearing role while allowing a bank to be deliberately relocated.
     if (gameState.input.windActive > 0 && applyWind(cell, dt)) cell.density -= CONFIG.FOG_CLEAR * dt / CONFIG.WIND_DURATION;
     cell.x += cell.vx * dt; cell.y += cell.vy * dt; cell.vx *= CONFIG.FOG_DAMPING; cell.vy *= CONFIG.FOG_DAMPING;
     const suppressed = gameState.windObjects.some(object => object?.active &&
       Math.hypot(cell.x - (object.x + object.width / 2), cell.y - (object.y + object.height / 2)) <= CONFIG.BUOY.FOG_SUPPRESSION_RADIUS);
-    const recovery = (cell.core ? CONFIG.FOG_CORE_RECOVERY : CONFIG.FOG_RECOVERY) *
+    const searchlightSource = cell.homeX >= CONFIG.SEARCHLIGHT.SOURCE_MIN_X && cell.homeX <= CONFIG.SEARCHLIGHT.SOURCE_MAX_X;
+    const recovery = (searchlightSource ? CONFIG.SEARCHLIGHT.SOURCE_RECOVERY : cell.core ? CONFIG.FOG_CORE_RECOVERY : CONFIG.FOG_RECOVERY) *
       (suppressed ? CONFIG.BUOY.FOG_RECOVERY_MULTIPLIER : 1);
-    const target = normalized ? CONFIG.FOG_MIN : cell.baseDensity * (gameState.boss.anomaly / CONFIG.BOSS_ANOMALY);
+    const sourceDensity = searchlightSource ? Math.max(cell.baseDensity, CONFIG.SEARCHLIGHT.SOURCE_MIN_DENSITY) : cell.baseDensity;
+    const target = normalized ? CONFIG.FOG_MIN : sourceDensity * (gameState.boss.anomaly / CONFIG.BOSS_ANOMALY);
     cell.density += (target - cell.density) * recovery * dt;
     cell.density = clamp(cell.density - (normalized ? CONFIG.NORMALIZE_FADE * dt : 0), CONFIG.FOG_MIN, CONFIG.FOG_MAX);
     cell.x += (cell.homeX - cell.x) * recovery * dt; cell.y += (cell.homeY - cell.y) * recovery * dt;
+  }
+}
+function fogDensityAt(x, y) {
+  let density = CONFIG.FOG_MIN;
+  for (const cell of gameState.fogCells) {
+    if (!cell || cell.density <= density) continue;
+    const distance = Math.hypot(cell.x - x, cell.y - y);
+    if (distance <= CONFIG.SEARCHLIGHT.FOG_SAMPLE_RADIUS) density = Math.max(density, cell.density);
+  }
+  return clamp(density, CONFIG.FOG_MIN, CONFIG.FOG_MAX);
+}
+function updateHazards() {
+  for (const hazard of gameState.hazards) {
+    if (!hazard?.active || hazard.type !== "searchlight") continue;
+    const directionLength = Math.hypot(hazard.directionX, hazard.directionY) || 1;
+    const dx = hazard.directionX / directionLength, dy = hazard.directionY / directionLength;
+    let endpointDistance = CONFIG.SEARCHLIGHT.BEAM_RANGE;
+    hazard.blockedByFog = false;
+    for (let distance = CONFIG.SEARCHLIGHT.SAMPLE_STEP; distance <= endpointDistance; distance += CONFIG.SEARCHLIGHT.SAMPLE_STEP) {
+      const sampleX = hazard.x + dx * distance, sampleY = hazard.y + dy * distance;
+      if (sampleY >= CONFIG.GROUND_Y) { endpointDistance = distance; break; }
+      if (fogDensityAt(sampleX, sampleY) >= CONFIG.SEARCHLIGHT.FOG_BLOCK_THRESHOLD) {
+        endpointDistance = distance; hazard.blockedByFog = true; break;
+      }
+    }
+    hazard.beamEndX = hazard.x + dx * endpointDistance;
+    hazard.beamEndY = Math.min(CONFIG.GROUND_Y, hazard.y + dy * endpointDistance);
+    const beamBounds = {
+      x: Math.min(hazard.x, hazard.beamEndX) - CONFIG.SEARCHLIGHT.BEAM_WIDTH / 2,
+      y: Math.min(hazard.y, hazard.beamEndY) - CONFIG.SEARCHLIGHT.BEAM_WIDTH / 2,
+      w: Math.abs(hazard.beamEndX - hazard.x) + CONFIG.SEARCHLIGHT.BEAM_WIDTH,
+      h: Math.abs(hazard.beamEndY - hazard.y) + CONFIG.SEARCHLIGHT.BEAM_WIDTH
+    };
+    if (overlaps(gameState.player, beamBounds)) damagePlayer(hazard.x, CONFIG.SEARCHLIGHT.DAMAGE, CONFIG.SEARCHLIGHT.HIT_COOLDOWN);
   }
 }
 function updateBoss(dt) {
@@ -410,7 +462,7 @@ function update(rawDt) {
   state.time += dt; state.input.windCooldown = Math.max(0, state.input.windCooldown - dt); state.input.windActive = Math.max(0, state.input.windActive - dt);
   state.stage.anchorFeedbackTimer = Math.max(0, state.stage.anchorFeedbackTimer - dt);
   if (controls.windHeld && state.input.windCooldown === 0) beginWind(controls.windDirection);
-  updateWindObjects(dt); updatePlayer(dt, controls); updateEnemies(dt); updateProjectiles(dt); updateFog(dt); updateBoss(dt); updateParticles(dt);
+  updateWindObjects(dt); updatePlayer(dt, controls); updateEnemies(dt); updateProjectiles(dt); updateFog(dt); updateHazards(); updateBoss(dt); updateParticles(dt);
   state.enemies = state.enemies.filter(enemy => enemy?.active);
   state.projectiles = state.projectiles.filter(shot => shot && shot.life > 0 && shot.x > -CONFIG.PROJECTILE_MARGIN && shot.x < CONFIG.WORLD_WIDTH + CONFIG.PROJECTILE_MARGIN && shot.y > -CONFIG.PROJECTILE_MARGIN && shot.y < CONFIG.HEIGHT + CONFIG.PROJECTILE_MARGIN);
   state.particles = state.particles.filter(particle => particle && particle.life > 0);
@@ -431,6 +483,7 @@ function renderWorld() {
   const cam = gameState.camera.x; ctx.save(); ctx.translate(-cam, 0);
   ctx.fillStyle = CONFIG.PLATFORM_COLOR; ctx.fillRect(0, CONFIG.GROUND_Y, CONFIG.WORLD_WIDTH, CONFIG.HEIGHT - CONFIG.GROUND_Y);
   ctx.fillStyle = "#395c68"; for (let x = 0; x < CONFIG.WORLD_WIDTH; x += 80) ctx.fillRect(x, CONFIG.GROUND_Y, 58, 7);
+  renderHazards();
   const zonePulse = gameState.stage.anchorNeutralized || gameState.stage.anchorFeedbackTimer > 0;
   ctx.fillStyle = zonePulse ? "#7ce8cf55" : "#6fc6d52b";
   ctx.strokeStyle = zonePulse ? "#b7ffe9" : "#79c9d4";
@@ -469,6 +522,40 @@ function renderWorld() {
   for (const particle of gameState.particles) if (particle) { ctx.globalAlpha = clamp(particle.life / CONFIG.PARTICLE_LIFE, 0, 1); ctx.fillStyle = particle.kind === "buoyBlock" ? "#b9f7ff" : particle.kind === "anchorNeutralized" ? "#9affdf" : "#fff2a0"; ctx.fillRect(particle.x, particle.y, 5, 5); } ctx.globalAlpha = 1;
   if (gameState.input.windActive > 0) { const d = gameState.input.windDir, cx = p.x + p.w / 2, cy = p.y + p.h / 2; ctx.strokeStyle = "#a8f5ff"; ctx.lineWidth = 5; ctx.lineCap = "round"; for (let i = -1; i <= 1; i += 1) { ctx.beginPath(); ctx.moveTo(cx - d.y * i * 22, cy + d.x * i * 22); ctx.lineTo(cx + d.x * CONFIG.WIND_RANGE - d.y * i * 22, cy + d.y * CONFIG.WIND_RANGE + d.x * i * 22); ctx.stroke(); } }
   for (const cell of gameState.fogCells) if (cell?.density > 0) { ctx.globalAlpha = cell.density * CONFIG.FOG_ALPHA; ctx.fillStyle = "#d6e1e4"; ctx.beginPath(); ctx.arc(cell.x, cell.y, CONFIG.FOG_RADIUS, 0, Math.PI * 2); ctx.fill(); } ctx.globalAlpha = 1; ctx.restore();
+}
+function renderHazards() {
+  for (const hazard of gameState.hazards) {
+    if (!hazard?.active || hazard.type !== "searchlight") continue;
+    ctx.save();
+    ctx.globalAlpha = CONFIG.SEARCHLIGHT.ALPHA;
+    ctx.strokeStyle = CONFIG.SEARCHLIGHT.COLOR;
+    ctx.lineWidth = CONFIG.SEARCHLIGHT.BEAM_WIDTH;
+    ctx.lineCap = "butt";
+    ctx.shadowColor = CONFIG.SEARCHLIGHT.COLOR;
+    ctx.shadowBlur = CONFIG.SEARCHLIGHT.BLOCK_GLOW_RADIUS;
+    ctx.beginPath(); ctx.moveTo(hazard.x, hazard.y); ctx.lineTo(hazard.beamEndX, hazard.beamEndY); ctx.stroke();
+    ctx.globalAlpha = CONFIG.SEARCHLIGHT.BLOCK_GLOW_ALPHA;
+    ctx.lineWidth = CONFIG.SEARCHLIGHT.BEAM_EDGE_WIDTH;
+    ctx.beginPath(); ctx.moveTo(hazard.x, hazard.y); ctx.lineTo(hazard.beamEndX, hazard.beamEndY); ctx.stroke();
+    ctx.shadowBlur = 0;
+    drawAsset(ASSETS.searchlight,
+      hazard.x - CONFIG.SEARCHLIGHT.EMITTER_RADIUS, hazard.y - CONFIG.SEARCHLIGHT.EMITTER_RADIUS,
+      CONFIG.SEARCHLIGHT.EMITTER_RADIUS * 2, CONFIG.SEARCHLIGHT.EMITTER_RADIUS * 2, () => {
+        ctx.fillStyle = CONFIG.SEARCHLIGHT.COLOR; ctx.beginPath();
+        ctx.arc(hazard.x, hazard.y, CONFIG.SEARCHLIGHT.EMITTER_RADIUS, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = CONFIG.PLATFORM_COLOR;
+        ctx.fillRect(hazard.x - CONFIG.SEARCHLIGHT.EMITTER_RADIUS,
+          hazard.y - CONFIG.SEARCHLIGHT.EMITTER_LENGTH, CONFIG.SEARCHLIGHT.EMITTER_RADIUS * 2,
+          CONFIG.SEARCHLIGHT.EMITTER_LENGTH);
+      });
+    if (hazard.blockedByFog) {
+      ctx.globalAlpha = CONFIG.SEARCHLIGHT.BLOCK_GLOW_ALPHA;
+      ctx.fillStyle = CONFIG.SEARCHLIGHT.COLOR;
+      ctx.beginPath(); ctx.arc(hazard.beamEndX, hazard.beamEndY,
+        CONFIG.SEARCHLIGHT.BLOCK_GLOW_RADIUS, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.restore();
+  }
 }
 function renderFogAnchor(enemy) {
   const staggered = enemy.state === "staggered";
