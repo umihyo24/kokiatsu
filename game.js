@@ -54,6 +54,27 @@ const CONFIG = Object.freeze({
   PARTICLE_LIFE: .65, PARTICLE_COUNT: 16, PARTICLE_SPEED: 130, PARTICLE_GRAVITY: 80,
   PLATFORM_COLOR: "#263e4b", HUD_PAD: 20, UI_BAR_W: 250, UI_BAR_H: 14,
   HINT_FADE_DISTANCE: 270, START_X: 90, START_Y: 390,
+  STAGE_IDS: Object.freeze(["fogHarbor", "thunderPlateau"]),
+  STAGES: Object.freeze({
+    fogHarbor: Object.freeze({ name: "Fog Harbor", subtitle: "霧の港湾" }),
+    thunderPlateau: Object.freeze({ name: "Thunder Plateau", subtitle: "雷鳴の高原" })
+  }),
+  THUNDER: Object.freeze({
+    CLOUD_WIND_RESPONSE: .82, CLOUD_MAX_SPEED: 150, CLOUD_DRAG: 72,
+    CLOUD_WIDTH: 130, CLOUD_HEIGHT: 66, CLOUD_Y: 340, CLOUD_MIN_X: 330,
+    CLOUD_MAX_X: 3110, STRIKE_INTERVAL: 4.4, BOSS_INTERVAL_STEP: .3,
+    MIN_STRIKE_INTERVAL: 3.25, TELEGRAPH_DURATION: 1.35, FAST_TELEGRAPH: 1.05,
+    STRIKE_DURATION: .34, STRIKE_WIDTH: 52, DAMAGE: 1, ROD_CAPTURE_RADIUS: 58,
+    ROD_WIDTH: 34, ROD_HEIGHT: 112, ROD_FEEDBACK_TIME: .8,
+    BARRIER_WIDTH: 28, BARRIER_HEIGHT: 190, BARRIER_Y: 265,
+    INTRO_CLOUD_X: 510, FIRST_ROD_X: 1040, FIRST_BARRIER_X: 1240,
+    SECOND_CLOUD_X: 1430, SECOND_ROD_X: 1780, SECOND_BARRIER_X: 2010,
+    BOSS_TRIGGER: 2350, BOSS_X: 2860, BOSS_Y: 180, BOSS_RADIUS: 145,
+    BOSS_CLOUD_X: 2500, BOSS_SECOND_CLOUD_X: 2960,
+    BOSS_RODS: Object.freeze([2625, 3020]), NORMALIZE_TIME: 3.2,
+    ANOMALY_HIT: 25, RAIN_STEP: 47, RAIN_SPEED: 155, SKY_FLASH_TIME: .16,
+    PARTICLE_COUNT: 22, HINT_FADE_DISTANCE: 330
+  }),
   HINTS: [
     [120, "← → で移動 / Z でジャンプ"], [520, "X + 方向キー：風で物体を押す"],
     [980, "空中で X：風と逆向きに反動"], [1450, "軽い敵は風で場外へ"],
@@ -89,7 +110,11 @@ const ASSETS = Object.freeze({
   buoy: createImage("cards.weather_fog_local_observe"),
   anchorIdle: createImage("monsters.monster_fog_heavy_idle"),
   anchorStagger: createImage("monsters.monster_fog_heavy_stagger"),
-  searchlight: createImage("cards.card_light_world_searchlight")
+  searchlight: createImage("cards.card_light_world_searchlight"),
+  thunderBoss: createImage("monsters.monster_thunder_boss_idle"),
+  chargeCloud: createImage("cards.card_thunder_world_cloud"),
+  lightning: createImage("cards.card_thunder_world_lightning"),
+  lightningRod: createImage("cards.card_thunder_world_rod")
 });
 function drawable(image) { return Boolean(image?.loadedSuccessfully && image.naturalWidth > 0 && image.naturalHeight > 0); }
 const clamp = (value, min, max) => Number.isFinite(value) ? Math.max(min, Math.min(max, value)) : min;
@@ -111,9 +136,9 @@ function makeFog() {
   }
   return cells;
 }
-function createGameState(phase = "start") {
+function createFogState(phase = "start", stageId = "fogHarbor", selectedStage = 0) {
   return {
-    phase, result: null, time: 0, camera: { x: 0 },
+    phase, result: null, stageId, selectedStage, time: 0, camera: { x: 0 },
     input: { keys: {}, pressed: {}, windActive: 0, windCooldown: 0, windDir: { x: 1, y: 0 } },
     player: { x: CONFIG.START_X, y: CONFIG.START_Y, w: CONFIG.PLAYER_W, h: CONFIG.PLAYER_H,
       moveVx: 0, externalVx: 0, vx: 0, vy: 0,
@@ -139,8 +164,42 @@ function createGameState(phase = "start") {
     hazards: [{ type: "searchlight", x: CONFIG.SEARCHLIGHT.X, y: CONFIG.SEARCHLIGHT.Y,
       directionX: CONFIG.SEARCHLIGHT.DIRECTION_X, directionY: CONFIG.SEARCHLIGHT.DIRECTION_Y,
       active: true, beamEndX: CONFIG.SEARCHLIGHT.X, beamEndY: CONFIG.GROUND_Y, blockedByFog: false }],
-    projectiles: [], fogCells: makeFog(), particles: []
+    projectiles: [], fogCells: makeFog(), weatherObjects: [], lightningStrikes: [], rods: [], barriers: [], particles: []
   };
+}
+function createChargeCloud(id, x, interval = CONFIG.THUNDER.STRIKE_INTERVAL, charging = true) {
+  return { id, type: "chargeCloud", x, y: CONFIG.THUNDER.CLOUD_Y, vx: 0, vy: 0,
+    w: CONFIG.THUNDER.CLOUD_WIDTH, h: CONFIG.THUNDER.CLOUD_HEIGHT,
+    width: CONFIG.THUNDER.CLOUD_WIDTH, height: CONFIG.THUNDER.CLOUD_HEIGHT,
+    chargeTimer: interval, strikeX: x + CONFIG.THUNDER.CLOUD_WIDTH / 2,
+    interval, active: true, charging, windResponseMultiplier: CONFIG.THUNDER.CLOUD_WIND_RESPONSE };
+}
+function createThunderState(phase = "playing", selectedStage = 1) {
+  const state = createFogState(phase, "thunderPlateau", selectedStage);
+  state.stage = { hints: [[150, "予告地点から離れて落雷を避けよう"], [470, "X + ← →：風で Charge Cloud を動かす"],
+    [920, "雲を Lightning Rod の上へ誘導"], [1430, "次の雲は少し速い — 予告を読もう"],
+    [2180, "2基の装置を起動し、雷雲の中心へ"], [2500, "落雷をロッドへ4回放電して正常化"]],
+    bossEntered: false, normalizedTimer: 0, skyFlash: 0 };
+  state.boss = { x: CONFIG.THUNDER.BOSS_X, y: CONFIG.THUNDER.BOSS_Y,
+    r: CONFIG.THUNDER.BOSS_RADIUS, anomaly: CONFIG.BOSS_ANOMALY, active: false };
+  state.enemies = []; state.windObjects = []; state.hazards = []; state.projectiles = []; state.fogCells = [];
+  state.weatherObjects = [
+    createChargeCloud("approach-one", CONFIG.THUNDER.INTRO_CLOUD_X),
+    createChargeCloud("approach-two", CONFIG.THUNDER.SECOND_CLOUD_X, CONFIG.THUNDER.STRIKE_INTERVAL - CONFIG.THUNDER.BOSS_INTERVAL_STEP)
+  ];
+  state.lightningStrikes = [];
+  state.rods = [
+    { id: "route-one", x: CONFIG.THUNDER.FIRST_ROD_X, powered: false, boss: false, feedback: 0 },
+    { id: "route-two", x: CONFIG.THUNDER.SECOND_ROD_X, powered: false, boss: false, feedback: 0 }
+  ];
+  state.barriers = [
+    { x: CONFIG.THUNDER.FIRST_BARRIER_X, poweredBy: "route-one" },
+    { x: CONFIG.THUNDER.SECOND_BARRIER_X, poweredBy: "route-two" }
+  ];
+  return state;
+}
+function createGameState(phase = "start", stageId = "fogHarbor", selectedStage = 0) {
+  return stageId === "thunderPlateau" ? createThunderState(phase, selectedStage) : createFogState(phase, stageId, selectedStage);
 }
 let gameState = createGameState();
 
@@ -453,18 +512,118 @@ function updateBoss(dt) {
 function updateParticles(dt) {
   for (const particle of gameState.particles) if (particle) { particle.x += particle.vx * dt; particle.y += particle.vy * dt; particle.vy += CONFIG.PARTICLE_GRAVITY * dt; particle.life -= dt; }
 }
+function rodAtStrike(x) {
+  return gameState.rods.find(rod => rod && Math.abs(rod.x - x) <= CONFIG.THUNDER.ROD_CAPTURE_RADIUS) ?? null;
+}
+function spawnLightning(cloud, telegraphDuration) {
+  if (!cloud?.active || gameState.lightningStrikes.some(strike => strike?.cloudId === cloud.id)) return;
+  cloud.strikeX = clamp(cloud.x + cloud.width / 2, CONFIG.THUNDER.CLOUD_MIN_X, CONFIG.THUNDER.CLOUD_MAX_X);
+  gameState.lightningStrikes.push({ type: "lightning", cloudId: cloud.id, x: cloud.strikeX,
+    y: cloud.y + cloud.height / 2, phase: "telegraph", timer: telegraphDuration, active: true, captured: false });
+}
+function activateLightning(strike) {
+  strike.phase = "strike"; strike.timer = CONFIG.THUNDER.STRIKE_DURATION;
+  const rod = rodAtStrike(strike.x);
+  if (rod) {
+    strike.captured = true; rod.powered = true; rod.feedback = CONFIG.THUNDER.ROD_FEEDBACK_TIME;
+    gameState.stage.skyFlash = CONFIG.THUNDER.SKY_FLASH_TIME;
+    if (rod.boss && gameState.boss.active && gameState.boss.anomaly > 0) {
+      gameState.boss.anomaly = clamp(gameState.boss.anomaly - CONFIG.THUNDER.ANOMALY_HIT, 0, CONFIG.BOSS_ANOMALY);
+      for (let i = 0; i < CONFIG.THUNDER.PARTICLE_COUNT; i += 1) {
+        const angle = i / CONFIG.THUNDER.PARTICLE_COUNT * Math.PI * 2;
+        gameState.particles.push({ x: rod.x, y: CONFIG.GROUND_Y - CONFIG.THUNDER.ROD_HEIGHT,
+          vx: Math.cos(angle) * CONFIG.PARTICLE_SPEED, vy: Math.sin(angle) * CONFIG.PARTICLE_SPEED,
+          life: CONFIG.PARTICLE_LIFE, kind: "electric" });
+      }
+    }
+  }
+  const hitbox = { x: strike.x - CONFIG.THUNDER.STRIKE_WIDTH / 2, y: 0,
+    w: CONFIG.THUNDER.STRIKE_WIDTH, h: CONFIG.GROUND_Y };
+  if (overlaps(gameState.player, hitbox)) damagePlayer(strike.x, CONFIG.THUNDER.DAMAGE);
+}
+function enterThunderBoss() {
+  const state = gameState;
+  state.boss.active = true; state.stage.bossEntered = true;
+  state.weatherObjects = [createChargeCloud("boss-primary", CONFIG.THUNDER.BOSS_CLOUD_X)];
+  state.lightningStrikes = [];
+  state.rods = CONFIG.THUNDER.BOSS_RODS.map((x, index) => ({ id: `boss-${index}`, x, powered: false, boss: true, feedback: 0 }));
+  state.barriers = [];
+}
+function updateThunderWeather(dt) {
+  const state = gameState, thunder = CONFIG.THUNDER;
+  if (!state.boss.active && state.player.x >= thunder.BOSS_TRIGGER && state.rods.filter(rod => rod?.powered).length === 2) enterThunderBoss();
+  if (state.boss.active && state.boss.anomaly <= 50 && state.weatherObjects.length === 1) {
+    state.weatherObjects.push(createChargeCloud("boss-secondary", thunder.BOSS_SECOND_CLOUD_X, thunder.STRIKE_INTERVAL, false));
+  }
+  const chargingCloud = state.weatherObjects.find(cloud => cloud?.active && cloud.charging);
+  for (const cloud of state.weatherObjects) {
+    if (!cloud?.active) continue;
+    if (state.input.windActive > 0) applyWind(cloud, dt);
+    const drag = thunder.CLOUD_DRAG * dt;
+    cloud.vx = Math.abs(cloud.vx) <= drag ? 0 : cloud.vx - Math.sign(cloud.vx) * drag;
+    cloud.vx = clamp(cloud.vx, -thunder.CLOUD_MAX_SPEED, thunder.CLOUD_MAX_SPEED);
+    cloud.x = clamp(cloud.x + cloud.vx * dt, thunder.CLOUD_MIN_X, thunder.CLOUD_MAX_X - cloud.width);
+    if (cloud !== chargingCloud || state.boss.anomaly === 0) continue;
+    cloud.chargeTimer -= dt;
+    if (cloud.chargeTimer <= 0) {
+      const fast = state.boss.active && state.boss.anomaly <= 25;
+      spawnLightning(cloud, fast ? thunder.FAST_TELEGRAPH : thunder.TELEGRAPH_DURATION);
+      const pressure = state.boss.active ? (CONFIG.BOSS_ANOMALY - state.boss.anomaly) / thunder.ANOMALY_HIT * thunder.BOSS_INTERVAL_STEP : 0;
+      cloud.chargeTimer = state.boss.active && state.boss.anomaly <= 25
+        ? thunder.STRIKE_INTERVAL + thunder.BOSS_INTERVAL_STEP * 2
+        : Math.max(thunder.MIN_STRIKE_INTERVAL, cloud.interval - pressure);
+      if (state.weatherObjects.length > 1) {
+        const next = state.weatherObjects[(state.weatherObjects.indexOf(cloud) + 1) % state.weatherObjects.length];
+        cloud.charging = false; next.charging = true; next.chargeTimer = cloud.chargeTimer;
+      }
+    }
+  }
+  for (const strike of state.lightningStrikes) {
+    if (!strike?.active) continue;
+    strike.timer -= dt;
+    if (strike.phase === "telegraph" && strike.timer <= 0) activateLightning(strike);
+    else if (strike.phase === "strike" && strike.timer <= 0) strike.active = false;
+  }
+  for (const rod of state.rods) if (rod) rod.feedback = Math.max(0, rod.feedback - dt);
+  state.lightningStrikes = state.lightningStrikes.filter(strike => strike?.active);
+  state.stage.skyFlash = Math.max(0, state.stage.skyFlash - dt);
+  if (state.boss.anomaly === 0 && !state.result) {
+    state.stage.normalizedTimer += dt;
+    if (state.stage.normalizedTimer >= thunder.NORMALIZE_TIME) { state.phase = "gameover"; state.result = "normalized"; }
+  }
+}
+function updateFogStage(dt) {
+  updateWindObjects(dt); updateEnemies(dt); updateProjectiles(dt); updateFog(dt); updateHazards(); updateBoss(dt);
+  gameState.enemies = gameState.enemies.filter(enemy => enemy?.active);
+  gameState.projectiles = gameState.projectiles.filter(shot => shot && shot.life > 0 && shot.x > -CONFIG.PROJECTILE_MARGIN && shot.x < CONFIG.WORLD_WIDTH + CONFIG.PROJECTILE_MARGIN && shot.y > -CONFIG.PROJECTILE_MARGIN && shot.y < CONFIG.HEIGHT + CONFIG.PROJECTILE_MARGIN);
+}
+function updateThunderStage(dt) {
+  updateThunderWeather(dt);
+  for (const barrier of gameState.barriers) {
+    const rod = gameState.rods.find(item => item?.id === barrier.poweredBy);
+    if (!rod?.powered && gameState.player.x + gameState.player.w > barrier.x && gameState.player.x < barrier.x + CONFIG.THUNDER.BARRIER_WIDTH) {
+      gameState.player.x = barrier.x - gameState.player.w; gameState.player.moveVx = Math.min(0, gameState.player.moveVx);
+    }
+  }
+}
+const STAGE_SYSTEMS = Object.freeze({ fogHarbor: updateFogStage, thunderPlateau: updateThunderStage });
 function update(rawDt) {
   const dt = clamp(rawDt, 0, CONFIG.DT_MAX);
   let state = gameState;
-  if (state.input.pressed.enter && (state.phase === "start" || state.phase === "gameover")) state = gameState = createGameState("playing");
+  if (state.phase === "start" && (state.input.pressed.left || state.input.pressed.up)) state.selectedStage = (state.selectedStage + CONFIG.STAGE_IDS.length - 1) % CONFIG.STAGE_IDS.length;
+  if (state.phase === "start" && (state.input.pressed.right || state.input.pressed.down)) state.selectedStage = (state.selectedStage + 1) % CONFIG.STAGE_IDS.length;
+  if (state.input.pressed.enter && state.phase === "start") {
+    const selectedStage = state.selectedStage;
+    state = gameState = createGameState("playing", CONFIG.STAGE_IDS[selectedStage], selectedStage);
+  } else if (state.input.pressed.enter && state.phase === "gameover") {
+    state = gameState = createGameState("playing", state.stageId, state.selectedStage);
+  }
   if (state.phase !== "playing") { state.input.pressed = {}; return; }
   const controls = interpretInput();
   state.time += dt; state.input.windCooldown = Math.max(0, state.input.windCooldown - dt); state.input.windActive = Math.max(0, state.input.windActive - dt);
   state.stage.anchorFeedbackTimer = Math.max(0, state.stage.anchorFeedbackTimer - dt);
   if (controls.windHeld && state.input.windCooldown === 0) beginWind(controls.windDirection);
-  updateWindObjects(dt); updatePlayer(dt, controls); updateEnemies(dt); updateProjectiles(dt); updateFog(dt); updateHazards(); updateBoss(dt); updateParticles(dt);
-  state.enemies = state.enemies.filter(enemy => enemy?.active);
-  state.projectiles = state.projectiles.filter(shot => shot && shot.life > 0 && shot.x > -CONFIG.PROJECTILE_MARGIN && shot.x < CONFIG.WORLD_WIDTH + CONFIG.PROJECTILE_MARGIN && shot.y > -CONFIG.PROJECTILE_MARGIN && shot.y < CONFIG.HEIGHT + CONFIG.PROJECTILE_MARGIN);
+  updatePlayer(dt, controls); (STAGE_SYSTEMS[state.stageId] ?? STAGE_SYSTEMS.fogHarbor)(dt); updateParticles(dt);
   state.particles = state.particles.filter(particle => particle && particle.life > 0);
   const targetCamera = clamp(state.player.x - CONFIG.CAMERA_LEAD, 0, CONFIG.WORLD_WIDTH - CONFIG.WIDTH);
   state.camera.x += (targetCamera - state.camera.x) * CONFIG.CAMERA_LERP;
@@ -472,14 +631,14 @@ function update(rawDt) {
 }
 
 function drawAsset(image, x, y, w, h, fallback) { if (drawable(image)) ctx.drawImage(image, x, y, w, h); else fallback(); }
-function renderBackground() {
+function renderFogBackground() {
   const clarity = 1 - gameState.boss.anomaly / CONFIG.BOSS_ANOMALY;
   const sky = ctx.createLinearGradient(0, 0, 0, CONFIG.HEIGHT); sky.addColorStop(0, `rgb(${36 + clarity * 85},${57 + clarity * 105},${76 + clarity * 130})`); sky.addColorStop(1, "#8bb5bd"); ctx.fillStyle = sky; ctx.fillRect(0, 0, CONFIG.WIDTH, CONFIG.HEIGHT);
   ctx.save(); ctx.translate(-gameState.camera.x * .25, 0); ctx.fillStyle = `rgba(210,235,238,${.2 + clarity * .55})`;
   for (let x = 0; x < CONFIG.WORLD_WIDTH; x += 310) { ctx.fillRect(x, 335, 190, 120); ctx.beginPath(); ctx.moveTo(x + 18, 335); ctx.lineTo(x + 95, 270); ctx.lineTo(x + 172, 335); ctx.fill(); }
   ctx.fillStyle = `rgba(47,116,148,${.3 + clarity * .5})`; ctx.fillRect(0, 420, CONFIG.WORLD_WIDTH, 80); ctx.restore();
 }
-function renderWorld() {
+function renderFogWorld() {
   const cam = gameState.camera.x; ctx.save(); ctx.translate(-cam, 0);
   ctx.fillStyle = CONFIG.PLATFORM_COLOR; ctx.fillRect(0, CONFIG.GROUND_Y, CONFIG.WORLD_WIDTH, CONFIG.HEIGHT - CONFIG.GROUND_Y);
   ctx.fillStyle = "#395c68"; for (let x = 0; x < CONFIG.WORLD_WIDTH; x += 80) ctx.fillRect(x, CONFIG.GROUND_Y, 58, 7);
@@ -586,19 +745,106 @@ function renderFogAnchor(enemy) {
     }
   }
 }
+function renderThunderBackground() {
+  const calm = 1 - gameState.boss.anomaly / CONFIG.BOSS_ANOMALY;
+  const sky = ctx.createLinearGradient(0, 0, 0, CONFIG.HEIGHT);
+  sky.addColorStop(0, `rgb(${35 + calm * 48},${39 + calm * 47},${64 + calm * 55})`);
+  sky.addColorStop(1, `rgb(${95 + calm * 40},${91 + calm * 36},${112 + calm * 34})`);
+  ctx.fillStyle = sky; ctx.fillRect(0, 0, CONFIG.WIDTH, CONFIG.HEIGHT);
+  ctx.save(); ctx.translate(-gameState.camera.x * .2, 0);
+  ctx.fillStyle = `rgba(31,38,57,${.82 - calm * .38})`;
+  for (let x = -120; x < CONFIG.WORLD_WIDTH + 300; x += 360) {
+    ctx.beginPath(); ctx.moveTo(x, CONFIG.GROUND_Y); ctx.lineTo(x + 160, 245); ctx.lineTo(x + 350, CONFIG.GROUND_Y); ctx.fill();
+  }
+  ctx.restore();
+  ctx.strokeStyle = `rgba(185,205,220,${.25 + calm * .35})`; ctx.lineWidth = 2;
+  for (let x = 15; x < CONFIG.WIDTH; x += CONFIG.THUNDER.RAIN_STEP) {
+    const offset = (gameState.time * CONFIG.THUNDER.RAIN_SPEED + x * 3) % CONFIG.HEIGHT;
+    ctx.beginPath(); ctx.moveTo(x, offset); ctx.lineTo(x - 7, offset + 18); ctx.stroke();
+  }
+  if (gameState.stage.skyFlash > 0) { ctx.fillStyle = "#f1edff88"; ctx.fillRect(0, 0, CONFIG.WIDTH, CONFIG.HEIGHT); }
+}
+function renderLightningRod(rod) {
+  const x = rod.x, top = CONFIG.GROUND_Y - CONFIG.THUNDER.ROD_HEIGHT;
+  if (rod.feedback > 0 || rod.powered) { ctx.fillStyle = "#86ecff44"; ctx.beginPath(); ctx.arc(x, top, CONFIG.THUNDER.ROD_CAPTURE_RADIUS, 0, Math.PI * 2); ctx.fill(); }
+  drawAsset(ASSETS.lightningRod, x - CONFIG.THUNDER.ROD_WIDTH / 2, top,
+    CONFIG.THUNDER.ROD_WIDTH, CONFIG.THUNDER.ROD_HEIGHT, () => {
+      ctx.strokeStyle = rod.powered ? "#aff7ff" : "#8d9ba7"; ctx.lineWidth = 7;
+      ctx.beginPath(); ctx.moveTo(x, CONFIG.GROUND_Y); ctx.lineTo(x, top + 12); ctx.lineTo(x - 12, top + 25); ctx.moveTo(x, top + 12); ctx.lineTo(x + 12, top + 25); ctx.stroke();
+      ctx.fillStyle = rod.powered ? "#fff4a6" : "#b8c3cc"; ctx.beginPath(); ctx.arc(x, top + 5, 9, 0, Math.PI * 2); ctx.fill();
+    });
+}
+function renderThunderWorld() {
+  ctx.save(); ctx.translate(-gameState.camera.x, 0);
+  ctx.fillStyle = "#28343e"; ctx.fillRect(0, CONFIG.GROUND_Y, CONFIG.WORLD_WIDTH, CONFIG.HEIGHT - CONFIG.GROUND_Y);
+  ctx.fillStyle = "#526b68"; for (let x = 0; x < CONFIG.WORLD_WIDTH; x += 92) ctx.fillRect(x, CONFIG.GROUND_Y, 65, 8);
+  for (const barrier of gameState.barriers) {
+    const powered = gameState.rods.find(rod => rod?.id === barrier.poweredBy)?.powered;
+    if (powered) continue;
+    ctx.fillStyle = "#9adaff55"; ctx.strokeStyle = "#a9edff"; ctx.lineWidth = 3;
+    ctx.fillRect(barrier.x, CONFIG.THUNDER.BARRIER_Y, CONFIG.THUNDER.BARRIER_WIDTH, CONFIG.THUNDER.BARRIER_HEIGHT);
+    for (let y = CONFIG.THUNDER.BARRIER_Y; y < CONFIG.GROUND_Y; y += 24) { ctx.beginPath(); ctx.moveTo(barrier.x, y); ctx.lineTo(barrier.x + CONFIG.THUNDER.BARRIER_WIDTH, y + 12); ctx.stroke(); }
+  }
+  for (const rod of gameState.rods) if (rod) renderLightningRod(rod);
+  if (gameState.boss.active || gameState.player.x > CONFIG.THUNDER.BOSS_TRIGGER - CONFIG.WIDTH) {
+    const boss = gameState.boss, calm = 1 - boss.anomaly / CONFIG.BOSS_ANOMALY;
+    ctx.save(); ctx.globalAlpha = .35 + boss.anomaly / CONFIG.BOSS_ANOMALY * .65;
+    drawAsset(ASSETS.thunderBoss, boss.x - boss.r, boss.y - boss.r, boss.r * 2, boss.r * 2, () => {
+      ctx.fillStyle = `rgba(${48 + calm * 75},${51 + calm * 78},${72 + calm * 82},${.96 - calm * .3})`;
+      for (let i = -2; i <= 2; i += 1) { const spread = 42 + calm * 24; ctx.beginPath(); ctx.arc(boss.x + i * spread, boss.y + Math.abs(i) * (12 + calm * 10), boss.r * (.52 - calm * .16), 0, Math.PI * 2); ctx.fill(); }
+    }); ctx.restore();
+  }
+  for (const cloud of gameState.weatherObjects) {
+    if (!cloud?.active) continue;
+    drawAsset(ASSETS.chargeCloud, cloud.x, cloud.y, cloud.width, cloud.height, () => {
+      ctx.fillStyle = cloud.charging ? "#45465d" : "#626778";
+      ctx.beginPath(); ctx.ellipse(cloud.x + cloud.width / 2, cloud.y + cloud.height / 2, cloud.width / 2, cloud.height / 2, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = cloud.charging ? "#f4e77b" : "#a9b2c1"; ctx.fillRect(cloud.x + cloud.width / 2 - 5, cloud.y + cloud.height - 13, 10, 7);
+    });
+  }
+  for (const strike of gameState.lightningStrikes) {
+    if (!strike?.active) continue;
+    if (strike.phase === "telegraph") {
+      const progress = 1 - strike.timer / (gameState.boss.active && gameState.boss.anomaly <= 25 ? CONFIG.THUNDER.FAST_TELEGRAPH : CONFIG.THUNDER.TELEGRAPH_DURATION);
+      ctx.fillStyle = `rgba(255,226,90,${.18 + progress * .42})`; ctx.fillRect(strike.x - CONFIG.THUNDER.STRIKE_WIDTH / 2, CONFIG.GROUND_Y - 10, CONFIG.THUNDER.STRIKE_WIDTH, 10);
+      ctx.strokeStyle = `rgba(235,225,255,${.18 + progress * .55})`; ctx.lineWidth = 2 + progress * 3; ctx.setLineDash([9, 12]);
+      ctx.beginPath(); ctx.moveTo(strike.x, strike.y); ctx.lineTo(strike.x, CONFIG.GROUND_Y); ctx.stroke(); ctx.setLineDash([]);
+    } else {
+      ctx.strokeStyle = strike.captured ? "#bffbff" : "#fff7bd"; ctx.lineWidth = CONFIG.THUNDER.STRIKE_WIDTH; ctx.shadowColor = "#d9eaff"; ctx.shadowBlur = 25;
+      ctx.beginPath(); ctx.moveTo(strike.x, strike.y); ctx.lineTo(strike.x, CONFIG.GROUND_Y); ctx.stroke(); ctx.shadowBlur = 0;
+    }
+  }
+  const p = gameState.player;
+  if (p.invuln <= 0 || Math.floor(gameState.time * 12) % 2 === 0) { ctx.fillStyle = "#f5fbff"; ctx.fillRect(p.x, p.y, p.w, p.h); ctx.fillStyle = "#2dcbe4"; ctx.fillRect(p.x + (p.facing > 0 ? 21 : 5), p.y + 12, 8, 8); ctx.fillStyle = "#efb94b"; ctx.fillRect(p.x + 7, p.y + 31, 20, 6); }
+  for (const particle of gameState.particles) if (particle) { ctx.globalAlpha = clamp(particle.life / CONFIG.PARTICLE_LIFE, 0, 1); ctx.fillStyle = "#c8fbff"; ctx.fillRect(particle.x, particle.y, 5, 5); } ctx.globalAlpha = 1;
+  if (gameState.input.windActive > 0) { const d = gameState.input.windDir, cx = p.x + p.w / 2, cy = p.y + p.h / 2; ctx.strokeStyle = "#a8f5ff"; ctx.lineWidth = 5; for (let i = -1; i <= 1; i += 1) { ctx.beginPath(); ctx.moveTo(cx - d.y * i * 22, cy + d.x * i * 22); ctx.lineTo(cx + d.x * CONFIG.WIND_RANGE - d.y * i * 22, cy + d.y * CONFIG.WIND_RANGE + d.x * i * 22); ctx.stroke(); } }
+  ctx.restore();
+}
 function renderUI() {
   ctx.fillStyle = "#07131dcc"; ctx.fillRect(CONFIG.HUD_PAD, CONFIG.HUD_PAD, CONFIG.UI_BAR_W + 20, 76); ctx.fillStyle = "#fff"; ctx.font = "bold 18px system-ui"; ctx.fillText(`HP ${"◆".repeat(gameState.player.hp)}${"◇".repeat(CONFIG.PLAYER_HP - gameState.player.hp)}`, 32, 48); ctx.fillText(`Weather Anomaly ${gameState.boss.anomaly}%`, 32, 78);
   ctx.fillStyle = "#213544"; ctx.fillRect(300, 25, CONFIG.UI_BAR_W, CONFIG.UI_BAR_H); ctx.fillStyle = gameState.boss.anomaly > 50 ? "#d98ba7" : "#77d9e6"; ctx.fillRect(300, 25, CONFIG.UI_BAR_W * gameState.boss.anomaly / CONFIG.BOSS_ANOMALY, CONFIG.UI_BAR_H);
   if (gameState.phase === "playing") { let nearest = null, distance = Infinity; for (const hint of gameState.stage.hints) { const d = Math.abs(gameState.player.x - hint[0]); if (d < distance) { distance = d; nearest = hint; } } if (nearest && distance < CONFIG.HINT_FADE_DISTANCE) { ctx.textAlign = "center"; ctx.font = "bold 19px system-ui"; ctx.fillStyle = "#07131dcc"; ctx.fillRect(235, 475, 490, 42); ctx.fillStyle = "#effcff"; ctx.fillText(nearest[1], 480, 503); ctx.textAlign = "left"; } }
-  if (gameState.boss.active && gameState.boss.anomaly > 0) { ctx.textAlign = "center"; ctx.fillStyle = localCoreFog() < CONFIG.BOSS_FOG_THRESHOLD ? "#fff2a0" : "#e4edf0"; ctx.fillText(localCoreFog() < CONFIG.BOSS_FOG_THRESHOLD ? "CORE EXPOSED — 反射弾を当てろ！" : "核周辺の霧を風で晴らせ", 480, 70); ctx.textAlign = "left"; }
+  if (gameState.boss.active && gameState.boss.anomaly > 0) { ctx.textAlign = "center";
+    if (gameState.stageId === "fogHarbor") { ctx.fillStyle = localCoreFog() < CONFIG.BOSS_FOG_THRESHOLD ? "#fff2a0" : "#e4edf0"; ctx.fillText(localCoreFog() < CONFIG.BOSS_FOG_THRESHOLD ? "CORE EXPOSED — 反射弾を当てろ！" : "核周辺の霧を風で晴らせ", 480, 70); }
+    else { ctx.fillStyle = "#fff2a0"; ctx.fillText("CHARGE CLOUDを動かし、落雷をロッドへ放電", 480, 70); }
+    ctx.textAlign = "left"; }
 }
 function renderOverlay() {
   if (gameState.phase === "playing") return;
   ctx.fillStyle = "#06131dcc"; ctx.fillRect(0, 0, CONFIG.WIDTH, CONFIG.HEIGHT); ctx.textAlign = "center"; ctx.fillStyle = "#effcff"; ctx.font = "bold 34px system-ui";
-  const title = gameState.phase === "start" ? "Weather Normalization Action Game" : gameState.result === "normalized" ? "WEATHER NORMALIZED" : "LOST IN THE FOG"; ctx.fillText(title, CONFIG.WIDTH / 2, 205);
-  ctx.font = "20px system-ui"; ctx.fillStyle = gameState.result === "normalized" ? "#aaf8dc" : "#c6eaf5"; ctx.fillText(gameState.phase === "start" ? "Prototype 01: Fog" : gameState.result === "normalized" ? "港に青空と穏やかな風が戻った" : "気象異常に飲み込まれた", CONFIG.WIDTH / 2, 250); ctx.fillStyle = "#fff"; ctx.fillText("Enter を押して開始 / リトライ", CONFIG.WIDTH / 2, 310); ctx.textAlign = "left";
+  const title = gameState.phase === "start" ? "Weather Normalization Action Game" : gameState.result === "normalized" ? "WEATHER NORMALIZED" : "WEATHER OVERWHELMED"; ctx.fillText(title, CONFIG.WIDTH / 2, 170);
+  if (gameState.phase === "start") {
+    ctx.font = "bold 23px system-ui";
+    CONFIG.STAGE_IDS.forEach((id, index) => { ctx.fillStyle = index === gameState.selectedStage ? "#fff2a0" : "#8fa7b5"; ctx.fillText(`${index === gameState.selectedStage ? "▶ " : ""}${CONFIG.STAGES[id].name}`, CONFIG.WIDTH / 2, 225 + index * 48); });
+    ctx.font = "18px system-ui"; ctx.fillStyle = "#c6eaf5"; ctx.fillText("← → でステージ選択", CONFIG.WIDTH / 2, 340); ctx.fillStyle = "#fff"; ctx.fillText("Enter で開始", CONFIG.WIDTH / 2, 378);
+  } else {
+    const name = CONFIG.STAGES[gameState.stageId]?.name ?? "Weather Region";
+    const normalizedMessage = gameState.stageId === "thunderPlateau" ? "穏やかな高原の夕立へ戻った" : "港に青空と穏やかな風が戻った";
+    ctx.font = "20px system-ui"; ctx.fillStyle = gameState.result === "normalized" ? "#aaf8dc" : "#c6eaf5"; ctx.fillText(`${name} — ${gameState.result === "normalized" ? normalizedMessage : "気象異常に飲み込まれた"}`, CONFIG.WIDTH / 2, 235); ctx.fillStyle = "#fff"; ctx.fillText("Enter を押してリトライ", CONFIG.WIDTH / 2, 300);
+  }
+  ctx.textAlign = "left";
 }
-function render() { ctx.clearRect(0, 0, CONFIG.WIDTH, CONFIG.HEIGHT); renderBackground(); renderWorld(); renderUI(); renderOverlay(); }
+function render() { ctx.clearRect(0, 0, CONFIG.WIDTH, CONFIG.HEIGHT); if (gameState.stageId === "thunderPlateau") { renderThunderBackground(); renderThunderWorld(); } else { renderFogBackground(); renderFogWorld(); } renderUI(); renderOverlay(); }
 
 let previous = performance.now();
 function frame(now) { const dt = (now - previous) / 1000; previous = now; update(dt); render(); requestAnimationFrame(frame); }
