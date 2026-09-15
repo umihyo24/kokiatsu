@@ -5,7 +5,7 @@ A dependency-free Canvas side-scrolling action prototype. Open `index.html` in a
 ## Controls
 
 - **← / →** move
-- **Space** jump
+- **Z** jump
 - **X** cast wind (hold a direction, or use the facing direction)
 - **Enter** start / retry
 
