@@ -5,6 +5,7 @@ const CONFIG = Object.freeze({
   WIDTH: 960, HEIGHT: 540, WORLD_WIDTH: 3200, GROUND_Y: 455, DT_MAX: .033,
   PLAYER_W: 34, PLAYER_H: 48, PLAYER_HP: 3, PLAYER_SPEED: 220, PLAYER_ACCEL: 1500,
   PLAYER_FRICTION: 1800, JUMP_SPEED: 430, GRAVITY: 1100, MAX_X_SPEED: 430, MAX_Y_SPEED: 650,
+  EXTERNAL_AIR_DRAG: 520, EXTERNAL_GROUND_DRAG: 2600, EXTERNAL_STOP_EPSILON: 6,
   INVULN: 1.05, KNOCKBACK_X: 190, KNOCKBACK_Y: 220,
   WIND_RANGE: 205, WIND_WIDTH: 118, WIND_FORCE: 2550, WIND_RECOIL: 760,
   WIND_DURATION: .14, WIND_COOLDOWN: .12, WIND_ENEMY: 1.35, WIND_PROJECTILE: 1.25,
@@ -78,7 +79,8 @@ function createGameState(phase = "start") {
   return {
     phase, result: null, time: 0, camera: { x: 0 },
     input: { keys: {}, pressed: {}, windActive: 0, windCooldown: 0, windDir: { x: 1, y: 0 } },
-    player: { x: CONFIG.START_X, y: CONFIG.START_Y, w: CONFIG.PLAYER_W, h: CONFIG.PLAYER_H, vx: 0, vy: 0,
+    player: { x: CONFIG.START_X, y: CONFIG.START_Y, w: CONFIG.PLAYER_W, h: CONFIG.PLAYER_H,
+      moveVx: 0, externalVx: 0, vx: 0, vy: 0,
       hp: CONFIG.PLAYER_HP, facing: 1, grounded: false, invuln: 0, recoilCount: 0, recoilReset: 0 },
     stage: { turretTimer: CONFIG.TURRET_RATE, hints: CONFIG.HINTS, bossEntered: false, normalizedTimer: 0 },
     boss: { x: CONFIG.BOSS_X, y: CONFIG.BOSS_Y, r: CONFIG.BOSS_R, anomaly: CONFIG.BOSS_ANOMALY, shotTimer: CONFIG.BOSS_SHOT_RATE, active: false },
@@ -88,13 +90,18 @@ function createGameState(phase = "start") {
 }
 let gameState = createGameState();
 
+function inputKey(event) {
+  const codeKeys = { ArrowLeft: "arrowleft", ArrowRight: "arrowright", ArrowUp: "arrowup", ArrowDown: "arrowdown", Space: " ", KeyX: "x", Enter: "enter" };
+  return codeKeys[event?.code] ?? event?.key?.toLowerCase() ?? "";
+}
 addEventListener("keydown", event => {
-  const key = event.key.toLowerCase();
+  const key = inputKey(event);
   if (["arrowleft", "arrowright", "arrowup", "arrowdown", " ", "x", "enter"].includes(key)) event.preventDefault();
   if (!gameState.input.keys[key]) gameState.input.pressed[key] = true;
   gameState.input.keys[key] = true;
 });
-addEventListener("keyup", event => { gameState.input.keys[event.key.toLowerCase()] = false; });
+addEventListener("keyup", event => { gameState.input.keys[inputKey(event)] = false; });
+addEventListener("blur", () => { gameState.input.keys = {}; gameState.input.pressed = {}; });
 
 function windDirection() {
   const keys = gameState.input.keys;
@@ -122,7 +129,7 @@ function beginWind() {
   const input = gameState.input, player = gameState.player;
   input.windActive = CONFIG.WIND_DURATION; input.windCooldown = CONFIG.WIND_COOLDOWN; input.windDir = windDirection();
   if (!player.grounded && player.recoilCount < CONFIG.RECOIL_LIMIT) {
-    player.vx -= input.windDir.x * CONFIG.WIND_RECOIL;
+    player.externalVx = clamp(player.externalVx - input.windDir.x * CONFIG.WIND_RECOIL, -CONFIG.MAX_X_SPEED, CONFIG.MAX_X_SPEED);
     player.vy -= input.windDir.y * CONFIG.WIND_RECOIL;
     player.recoilCount += 1; player.recoilReset = CONFIG.RECOIL_RESET;
   }
@@ -131,15 +138,22 @@ function damagePlayer(sourceX) {
   const p = gameState.player;
   if (p.invuln > 0 || gameState.result) return;
   p.hp = clamp(p.hp - 1, 0, CONFIG.PLAYER_HP); p.invuln = CONFIG.INVULN;
-  p.vx = p.x < sourceX ? -CONFIG.KNOCKBACK_X : CONFIG.KNOCKBACK_X; p.vy = -CONFIG.KNOCKBACK_Y;
+  p.externalVx = p.x < sourceX ? -CONFIG.KNOCKBACK_X : CONFIG.KNOCKBACK_X; p.vy = -CONFIG.KNOCKBACK_Y;
   if (p.hp === 0) { gameState.phase = "gameover"; gameState.result = "defeated"; }
 }
 function updatePlayer(dt) {
-  const p = gameState.player, input = gameState.input, left = input.keys.arrowleft, right = input.keys.arrowright;
-  if (left !== right) { p.vx += (right ? CONFIG.PLAYER_ACCEL : -CONFIG.PLAYER_ACCEL) * dt; p.facing = right ? 1 : -1; }
-  else { const drag = CONFIG.PLAYER_FRICTION * dt; p.vx = Math.abs(p.vx) <= drag ? 0 : p.vx - Math.sign(p.vx) * drag; }
+  const p = gameState.player, input = gameState.input;
+  // Normalize absent and released keys to the same boolean value. Comparing
+  // `undefined !== false` previously created acceleration in the opposite direction.
+  const left = Boolean(input.keys.arrowleft), right = Boolean(input.keys.arrowright);
+  if (left !== right) { p.moveVx += (right ? CONFIG.PLAYER_ACCEL : -CONFIG.PLAYER_ACCEL) * dt; p.facing = right ? 1 : -1; }
+  else { const drag = CONFIG.PLAYER_FRICTION * dt; p.moveVx = Math.abs(p.moveVx) <= drag ? 0 : p.moveVx - Math.sign(p.moveVx) * drag; }
+  p.moveVx = clamp(p.moveVx, -CONFIG.PLAYER_SPEED, CONFIG.PLAYER_SPEED);
+  const externalDrag = (p.grounded ? CONFIG.EXTERNAL_GROUND_DRAG : CONFIG.EXTERNAL_AIR_DRAG) * dt;
+  p.externalVx = Math.abs(p.externalVx) <= Math.max(externalDrag, CONFIG.EXTERNAL_STOP_EPSILON)
+    ? 0 : p.externalVx - Math.sign(p.externalVx) * externalDrag;
   if (input.pressed[" "] && p.grounded) { p.vy = -CONFIG.JUMP_SPEED; p.grounded = false; }
-  p.vy += CONFIG.GRAVITY * dt; p.vx = clamp(p.vx, -CONFIG.MAX_X_SPEED, CONFIG.MAX_X_SPEED); p.vy = clamp(p.vy, -CONFIG.MAX_Y_SPEED, CONFIG.MAX_Y_SPEED);
+  p.vy += CONFIG.GRAVITY * dt; p.vx = clamp(p.moveVx + p.externalVx, -CONFIG.MAX_X_SPEED, CONFIG.MAX_X_SPEED); p.vy = clamp(p.vy, -CONFIG.MAX_Y_SPEED, CONFIG.MAX_Y_SPEED);
   p.x = clamp(p.x + p.vx * dt, 0, CONFIG.WORLD_WIDTH - p.w); p.y += p.vy * dt;
   if (p.y + p.h >= CONFIG.GROUND_Y) { p.y = CONFIG.GROUND_Y - p.h; p.vy = 0; p.grounded = true; p.recoilCount = 0; }
   else p.grounded = false;
