@@ -26,7 +26,7 @@ const CONFIG = Object.freeze({
   PLATFORM_COLOR: "#263e4b", HUD_PAD: 20, UI_BAR_W: 250, UI_BAR_H: 14,
   HINT_FADE_DISTANCE: 270, START_X: 90, START_Y: 390,
   HINTS: [
-    [120, "← → で移動 / Space でジャンプ"], [520, "X + ← →：横風で物体を押す"],
+    [120, "← → で移動 / Z でジャンプ"], [520, "X + 方向キー：風で物体を押す"],
     [980, "空中で X：風と逆向きに反動"], [1450, "軽い敵は風で場外へ"],
     [1840, "弾は風で軌道を変えられる"], [2200, "霧を繰り返し吹き払い、先へ"],
     [2670, "核の霧を晴らし、敵弾を反射せよ"]
@@ -90,26 +90,47 @@ function createGameState(phase = "start") {
 }
 let gameState = createGameState();
 
+const GAMEPLAY_KEYS = Object.freeze({
+  ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down",
+  KeyZ: "jump", KeyX: "wind", Enter: "enter"
+});
 function inputKey(event) {
-  const codeKeys = { ArrowLeft: "arrowleft", ArrowRight: "arrowright", ArrowUp: "arrowup", ArrowDown: "arrowdown", Space: " ", KeyX: "x", Enter: "enter" };
-  return codeKeys[event?.code] ?? event?.key?.toLowerCase() ?? "";
+  return GAMEPLAY_KEYS[event?.code] ?? "";
 }
 addEventListener("keydown", event => {
   const key = inputKey(event);
-  if (["arrowleft", "arrowright", "arrowup", "arrowdown", " ", "x", "enter"].includes(key)) event.preventDefault();
+  if (!key) return;
+  event.preventDefault();
   if (!gameState.input.keys[key]) gameState.input.pressed[key] = true;
   gameState.input.keys[key] = true;
 });
-addEventListener("keyup", event => { gameState.input.keys[inputKey(event)] = false; });
-addEventListener("blur", () => { gameState.input.keys = {}; gameState.input.pressed = {}; });
+addEventListener("keyup", event => {
+  const key = inputKey(event);
+  if (!key) return;
+  event.preventDefault();
+  gameState.input.keys[key] = false;
+});
+function clearActiveInput() {
+  gameState.input.keys = {};
+  gameState.input.pressed = {};
+}
+addEventListener("blur", clearActiveInput);
+document.addEventListener("visibilitychange", () => { if (document.hidden) clearActiveInput(); });
 
-function windDirection() {
+// Convert raw key state once per frame so movement and wind share one interpretation.
+function interpretInput() {
   const keys = gameState.input.keys;
-  if (keys.arrowup) return { x: 0, y: -1 };
-  if (keys.arrowdown) return { x: 0, y: 1 };
-  if (keys.arrowleft) return { x: -1, y: 0 };
-  if (keys.arrowright) return { x: 1, y: 0 };
-  return { x: gameState.player.facing, y: 0 };
+  const left = Boolean(keys.left), right = Boolean(keys.right);
+  const up = Boolean(keys.up), down = Boolean(keys.down);
+  const movementX = left === right ? 0 : right ? 1 : -1;
+  // Opposing vertical inputs cancel; horizontal input/facing then determines wind.
+  const windY = up === down ? 0 : up ? -1 : 1;
+  return {
+    movementX,
+    jumpPressed: Boolean(gameState.input.pressed.jump),
+    windHeld: Boolean(keys.wind),
+    windDirection: windY ? { x: 0, y: windY } : { x: movementX || gameState.player.facing, y: 0 }
+  };
 }
 function inWindRegion(object, dir) {
   const p = gameState.player;
@@ -125,9 +146,9 @@ function applyWind(object, response, dt, dir = gameState.input.windDir) {
   object.vy = clamp((object.vy ?? 0) + dir.y * CONFIG.WIND_FORCE * response * dt, -CONFIG.MAX_Y_SPEED, CONFIG.MAX_Y_SPEED);
   return true;
 }
-function beginWind() {
+function beginWind(direction) {
   const input = gameState.input, player = gameState.player;
-  input.windActive = CONFIG.WIND_DURATION; input.windCooldown = CONFIG.WIND_COOLDOWN; input.windDir = windDirection();
+  input.windActive = CONFIG.WIND_DURATION; input.windCooldown = CONFIG.WIND_COOLDOWN; input.windDir = direction;
   if (!player.grounded && player.recoilCount < CONFIG.RECOIL_LIMIT) {
     player.externalVx = clamp(player.externalVx - input.windDir.x * CONFIG.WIND_RECOIL, -CONFIG.MAX_X_SPEED, CONFIG.MAX_X_SPEED);
     player.vy -= input.windDir.y * CONFIG.WIND_RECOIL;
@@ -141,18 +162,15 @@ function damagePlayer(sourceX) {
   p.externalVx = p.x < sourceX ? -CONFIG.KNOCKBACK_X : CONFIG.KNOCKBACK_X; p.vy = -CONFIG.KNOCKBACK_Y;
   if (p.hp === 0) { gameState.phase = "gameover"; gameState.result = "defeated"; }
 }
-function updatePlayer(dt) {
-  const p = gameState.player, input = gameState.input;
-  // Normalize absent and released keys to the same boolean value. Comparing
-  // `undefined !== false` previously created acceleration in the opposite direction.
-  const left = Boolean(input.keys.arrowleft), right = Boolean(input.keys.arrowright);
-  if (left !== right) { p.moveVx += (right ? CONFIG.PLAYER_ACCEL : -CONFIG.PLAYER_ACCEL) * dt; p.facing = right ? 1 : -1; }
+function updatePlayer(dt, controls) {
+  const p = gameState.player;
+  if (controls.movementX) { p.moveVx += controls.movementX * CONFIG.PLAYER_ACCEL * dt; p.facing = controls.movementX; }
   else { const drag = CONFIG.PLAYER_FRICTION * dt; p.moveVx = Math.abs(p.moveVx) <= drag ? 0 : p.moveVx - Math.sign(p.moveVx) * drag; }
   p.moveVx = clamp(p.moveVx, -CONFIG.PLAYER_SPEED, CONFIG.PLAYER_SPEED);
   const externalDrag = (p.grounded ? CONFIG.EXTERNAL_GROUND_DRAG : CONFIG.EXTERNAL_AIR_DRAG) * dt;
   p.externalVx = Math.abs(p.externalVx) <= Math.max(externalDrag, CONFIG.EXTERNAL_STOP_EPSILON)
     ? 0 : p.externalVx - Math.sign(p.externalVx) * externalDrag;
-  if (input.pressed[" "] && p.grounded) { p.vy = -CONFIG.JUMP_SPEED; p.grounded = false; }
+  if (controls.jumpPressed && p.grounded) { p.vy = -CONFIG.JUMP_SPEED; p.grounded = false; }
   p.vy += CONFIG.GRAVITY * dt; p.vx = clamp(p.moveVx + p.externalVx, -CONFIG.MAX_X_SPEED, CONFIG.MAX_X_SPEED); p.vy = clamp(p.vy, -CONFIG.MAX_Y_SPEED, CONFIG.MAX_Y_SPEED);
   p.x = clamp(p.x + p.vx * dt, 0, CONFIG.WORLD_WIDTH - p.w); p.y += p.vy * dt;
   if (p.y + p.h >= CONFIG.GROUND_Y) { p.y = CONFIG.GROUND_Y - p.h; p.vy = 0; p.grounded = true; p.recoilCount = 0; }
@@ -238,9 +256,10 @@ function update(rawDt) {
   let state = gameState;
   if (state.input.pressed.enter && (state.phase === "start" || state.phase === "gameover")) state = gameState = createGameState("playing");
   if (state.phase !== "playing") { state.input.pressed = {}; return; }
+  const controls = interpretInput();
   state.time += dt; state.input.windCooldown = Math.max(0, state.input.windCooldown - dt); state.input.windActive = Math.max(0, state.input.windActive - dt);
-  if (state.input.keys.x && state.input.windCooldown === 0) beginWind();
-  updatePlayer(dt); updateEnemies(dt); updateProjectiles(dt); updateFog(dt); updateBoss(dt); updateParticles(dt);
+  if (controls.windHeld && state.input.windCooldown === 0) beginWind(controls.windDirection);
+  updatePlayer(dt, controls); updateEnemies(dt); updateProjectiles(dt); updateFog(dt); updateBoss(dt); updateParticles(dt);
   state.enemies = state.enemies.filter(enemy => enemy?.alive);
   state.projectiles = state.projectiles.filter(shot => shot && shot.life > 0 && shot.x > -CONFIG.PROJECTILE_MARGIN && shot.x < CONFIG.WORLD_WIDTH + CONFIG.PROJECTILE_MARGIN && shot.y > -CONFIG.PROJECTILE_MARGIN && shot.y < CONFIG.HEIGHT + CONFIG.PROJECTILE_MARGIN);
   state.particles = state.particles.filter(particle => particle && particle.life > 0);
